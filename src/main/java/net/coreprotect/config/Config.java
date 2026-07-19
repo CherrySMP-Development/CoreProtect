@@ -431,7 +431,7 @@ public class Config extends Language {
 
         for (final File worldConfigFile : configFolder.listFiles((File file) -> file.getName().endsWith(".yml"))) {
             final String name = worldConfigFile.getName();
-            if (name.equals(ConfigFile.CONFIG) || name.equals(ConfigFile.LANGUAGE)) {
+            if (name.equals(ConfigFile.CONFIG) || name.equals(ConfigFile.LANGUAGE) || name.equals(CommandWhitelist.FILE_NAME)) {
                 continue;
             }
 

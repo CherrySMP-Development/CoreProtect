@@ -7,6 +7,7 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 
+import net.coreprotect.config.CommandWhitelist;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.language.Phrase;
 import net.coreprotect.thread.NetworkHandler;
@@ -32,54 +33,18 @@ public class CommandHandler implements CommandExecutor {
         String commandName = command.getName().toLowerCase(Locale.ROOT);
 
         if (commandName.equals("core") || commandName.equals("coreprotect") || commandName.equals("co")) {
+            if (!CommandWhitelist.isWhitelisted(user)) {
+                Chat.sendMessage(user, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_PERMISSION));
+                return true;
+            }
+
             int resultc = argumentArray.length;
             if (resultc > -1) {
                 String corecommand = "help";
                 if (resultc > 0) {
                     corecommand = argumentArray[0].toLowerCase(Locale.ROOT);
                 }
-                boolean permission = false;
-                if (!permission) {
-                    if (user.hasPermission("coreprotect.rollback") && (corecommand.equals("rollback") || corecommand.equals("rb") || corecommand.equals("ro") || corecommand.equals("apply") || corecommand.equals("cancel"))) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.restore") && (corecommand.equals("restore") || corecommand.equals("rs") || corecommand.equals("re") || corecommand.equals("undo") || corecommand.equals("apply") || corecommand.equals("cancel"))) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.inspect") && (corecommand.equals("i") || corecommand.equals("inspect") || corecommand.equals("inspector"))) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.help") && corecommand.equals("help")) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.purge") && corecommand.equals("purge")) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.lookup") && (corecommand.equals("l") || corecommand.equals("lookup") || corecommand.equals("page") || corecommand.equals("near"))) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.lookup.near") && corecommand.equals("near")) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.teleport") && (corecommand.equals("tp") || corecommand.equals("teleport"))) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.reload") && corecommand.equals("reload")) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.status") && (corecommand.equals("status") || corecommand.equals("stats") || corecommand.equals("version"))) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.consumer") && corecommand.equals("consumer")) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.networking") && corecommand.equals("network-debug")) {
-                        permission = true;
-                    }
-                    else if (user.hasPermission("coreprotect.give") && corecommand.equals("give")) {
-                        permission = true;
-                    }
-                }
+                boolean permission = true;
 
                 if (corecommand.equals("rollback") || corecommand.equals("restore") || corecommand.equals("rb") || corecommand.equals("rs") || corecommand.equals("ro") || corecommand.equals("re")) {
                     RollbackRestoreCommand.runCommand(user, command, permission, argumentArray, null, 0, 0);

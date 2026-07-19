@@ -19,6 +19,7 @@ import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 
 import net.coreprotect.bukkit.BukkitAdapter;
+import net.coreprotect.config.CommandWhitelist;
 import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Queue;
@@ -56,7 +57,7 @@ public final class PlayerInteractEntityListener extends Queue implements Listene
             }
             PlayerInteractListener.lastInspectorEvent.put(playerUuid, new Object[] { now, event.getHand() });
 
-            if (!player.hasPermission("coreprotect.inspect")) {
+            if (!CommandWhitelist.isWhitelisted(player)) {
                 Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_PERMISSION));
                 ConfigHandler.inspecting.put(player.getName(), false);
                 event.setCancelled(true);
@@ -121,7 +122,7 @@ public final class PlayerInteractEntityListener extends Queue implements Listene
             Object[] previousInspection = PlayerInteractListener.lastInspectorEvent.get(playerUuid);
             if (previousInspection == null || now - (long) previousInspection[0] >= 100L) {
                 PlayerInteractListener.lastInspectorEvent.put(playerUuid, new Object[] { now, event.getHand() });
-                if (!player.hasPermission("coreprotect.inspect")) {
+                if (!CommandWhitelist.isWhitelisted(player)) {
                     Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_PERMISSION));
                     ConfigHandler.inspecting.put(player.getName(), false);
                 }

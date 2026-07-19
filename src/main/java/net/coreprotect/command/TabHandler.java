@@ -2,6 +2,7 @@ package net.coreprotect.command;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -18,6 +19,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.util.StringUtil;
 
 import net.coreprotect.command.parser.RollbackStateParser;
+import net.coreprotect.config.CommandWhitelist;
 import net.coreprotect.config.ConfigHandler;
 
 public class TabHandler implements TabCompleter {
@@ -32,6 +34,9 @@ public class TabHandler implements TabCompleter {
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command cmd, String label, String[] args) {
+        if (!CommandWhitelist.isWhitelisted(sender)) {
+            return Collections.emptyList();
+        }
         if (!(sender instanceof Player) || args.length == 0) {
             return null;
         }
@@ -68,7 +73,7 @@ public class TabHandler implements TabCompleter {
         else if (args.length == 2) {
             return handleSecondArgCompletions(sender, argument0, args[1], paramState);
         }
-        else if (args.length == 3 && argument0.equals("purge") && sender.hasPermission("coreprotect.purge")) {
+        else if (args.length == 3 && argument0.equals("purge") && CommandWhitelist.isWhitelisted(sender)) {
             return handlePurgeThirdArgCompletions(args[1], args[2]);
         }
         else if (hasLookupCommand(argument0, sender) && (!argument0.equals("l") && !argument0.equals("lookup") || !paramState.hasPage)) {
@@ -82,32 +87,32 @@ public class TabHandler implements TabCompleter {
         String arg = argument.toLowerCase(Locale.ROOT);
         List<String> completions = new ArrayList<>();
 
-        addCompletionIfPermitted(sender, "coreprotect.help", "help", completions);
-        addCompletionIfPermitted(sender, "coreprotect.inspect", "inspect", completions);
-        addCompletionIfPermitted(sender, "coreprotect.rollback", "rollback", completions);
-        addCompletionIfPermitted(sender, "coreprotect.restore", "restore", completions);
-        addCompletionIfPermitted(sender, "coreprotect.lookup", "lookup", completions);
-        addCompletionIfPermitted(sender, "coreprotect.purge", "purge", completions);
-        addCompletionIfPermitted(sender, "coreprotect.reload", "reload", completions);
-        addCompletionIfPermitted(sender, "coreprotect.status", "status", completions);
-        addCompletionIfPermitted(sender, "coreprotect.lookup.near", "near", completions);
-        addCompletionIfPermitted(sender, "coreprotect.restore", "undo", completions);
+        addCompletionIfPermitted(sender, "help", completions);
+        addCompletionIfPermitted(sender, "inspect", completions);
+        addCompletionIfPermitted(sender, "rollback", completions);
+        addCompletionIfPermitted(sender, "restore", completions);
+        addCompletionIfPermitted(sender, "lookup", completions);
+        addCompletionIfPermitted(sender, "purge", completions);
+        addCompletionIfPermitted(sender, "reload", completions);
+        addCompletionIfPermitted(sender, "status", completions);
+        addCompletionIfPermitted(sender, "near", completions);
+        addCompletionIfPermitted(sender, "undo", completions);
 
         return StringUtil.copyPartialMatches(arg, completions, new ArrayList<>(completions.size()));
     }
 
-    private void addCompletionIfPermitted(CommandSender sender, String permission, String completion, List<String> completions) {
-        if (sender.hasPermission(permission)) {
+    private void addCompletionIfPermitted(CommandSender sender, String completion, List<String> completions) {
+        if (CommandWhitelist.isWhitelisted(sender)) {
             completions.add(completion);
         }
     }
 
     private boolean hasLookupPermission(CommandSender sender) {
-        return sender.hasPermission("coreprotect.lookup") || sender.hasPermission("coreprotect.rollback") || sender.hasPermission("coreprotect.restore");
+        return CommandWhitelist.isWhitelisted(sender);
     }
 
     private boolean hasTimePermission(CommandSender sender) {
-        return hasLookupPermission(sender) || sender.hasPermission("coreprotect.purge");
+        return CommandWhitelist.isWhitelisted(sender);
     }
 
     private boolean hasRadiusPermission(CommandSender sender) {
@@ -115,11 +120,11 @@ public class TabHandler implements TabCompleter {
     }
 
     private boolean hasPagePermission(CommandSender sender) {
-        return sender.hasPermission("coreprotect.lookup") || sender.hasPermission("coreprotect.lookup.near") || sender.hasPermission("coreprotect.inspect");
+        return CommandWhitelist.isWhitelisted(sender);
     }
 
     private boolean hasLookupCommand(String cmd, CommandSender sender) {
-        return (sender.hasPermission("coreprotect.lookup") && (cmd.equals("l") || cmd.equals("lookup"))) || (sender.hasPermission("coreprotect.rollback") && (cmd.equals("rollback") || cmd.equals("rb") || cmd.equals("ro"))) || (sender.hasPermission("coreprotect.restore") && (cmd.equals("restore") || cmd.equals("rs") || cmd.equals("re")));
+        return CommandWhitelist.isWhitelisted(sender) && (cmd.equals("l") || cmd.equals("lookup") || cmd.equals("rollback") || cmd.equals("rb") || cmd.equals("ro") || cmd.equals("restore") || cmd.equals("rs") || cmd.equals("re"));
     }
 
     private boolean isActionParam(String lastArg, String currentArg) {
@@ -442,11 +447,11 @@ public class TabHandler implements TabCompleter {
         String argument0 = cmd0.toLowerCase(Locale.ROOT);
         String argument1 = cmd1.toLowerCase(Locale.ROOT);
 
-        if (argument0.equals("help") && sender.hasPermission("coreprotect.help")) {
+        if (argument0.equals("help") && CommandWhitelist.isWhitelisted(sender)) {
             List<String> completions = new ArrayList<>(Arrays.asList(HELP));
             return StringUtil.copyPartialMatches(argument1, completions, new ArrayList<>(completions.size()));
         }
-        else if (argument0.equals("purge") && sender.hasPermission("coreprotect.purge")) {
+        else if (argument0.equals("purge") && CommandWhitelist.isWhitelisted(sender)) {
             List<String> completions = new ArrayList<>(Arrays.asList("t:", "r:", "i:"));
             return StringUtil.copyPartialMatches(argument1, completions, new ArrayList<>(completions.size()));
         }

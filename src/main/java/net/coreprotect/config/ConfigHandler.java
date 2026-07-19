@@ -311,6 +311,7 @@ public class ConfigHandler extends Queue {
         duckDBFallbackAllowed = !configFile.exists() && (!configFolder.exists() || (existingFiles != null && existingFiles.length == 0));
 
         Config.init();
+        CommandWhitelist.reload();
         ConfigFile.init(ConfigFile.LANGUAGE); // load user phrases
         ConfigFile.init(ConfigFile.LANGUAGE_CACHE); // load translation cache
 

@@ -1,0 +1,4 @@
+# Only player UUIDs listed here can use CoreProtect commands.
+# Bukkit permissions and operator status do not bypass this list.
+# Replace [] with entries such as: ["123e4567-e89b-12d3-a456-426614174000"]
+uuids: []

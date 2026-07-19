@@ -242,6 +242,7 @@ public class Language {
         phrases.put(Phrase.STATUS_DATABASE_STATE, "({writes halted|unreachable})");
         phrases.put(Phrase.STATUS_INTEGRATION, "{0}: Integration {enabled|disabled}.");
         phrases.put(Phrase.STATUS_LICENSE, "License: {0}");
+        phrases.put(Phrase.STATUS_STORAGE, "Storage used: {0} GB ({1} MB).");
         phrases.put(Phrase.STATUS_SYSTEM, "System: {0}");
         phrases.put(Phrase.STATUS_VERSION, "Version: {0}");
         phrases.put(Phrase.TELEPORTED, "Teleported to {0}.");

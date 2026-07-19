@@ -11,6 +11,7 @@ import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Consumer;
 import net.coreprotect.consumer.process.Process;
+import net.coreprotect.database.StorageUsage;
 import net.coreprotect.language.Phrase;
 import net.coreprotect.language.Selector;
 import net.coreprotect.patch.Patch;
@@ -79,6 +80,14 @@ public class StatusCommand {
                         databaseName += " " + Color.RED + Phrase.build(Phrase.STATUS_DATABASE_STATE, Selector.SECOND) + Color.WHITE;
                     }
                     Chat.sendMessage(player, Color.DARK_AQUA + Phrase.build(Phrase.STATUS_DATABASE, Color.WHITE, databaseName) + firstVersion);
+
+                    try {
+                        long storageBytes = StorageUsage.getUsedBytes();
+                        Chat.sendMessage(player, Color.DARK_AQUA + Phrase.build(Phrase.STATUS_STORAGE, Color.WHITE, StorageUsage.formatGigabytes(storageBytes), StorageUsage.formatMegabytes(storageBytes)));
+                    }
+                    catch (Exception exception) {
+                        ErrorReporter.report(exception);
+                    }
 
                     if (ConfigHandler.worldeditEnabled) {
                         Chat.sendMessage(player, Color.DARK_AQUA + Phrase.build(Phrase.STATUS_INTEGRATION, Color.WHITE, "WorldEdit", Selector.FIRST));

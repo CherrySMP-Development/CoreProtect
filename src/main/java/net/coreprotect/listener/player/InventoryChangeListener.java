@@ -190,22 +190,22 @@ public final class InventoryChangeListener extends Queue implements Listener {
 
                 List<ItemStack[]> viewerOldList = ConfigHandler.oldContainer.get(loggingChestIdViewer);
                 if (viewerOldList != null) { // viewer has pending consumer item
-                    int sizeOld = viewerOldList.size();
+                    List<ItemStack[]> viewerOldListSnapshot = new ArrayList<>(viewerOldList);
+                    int sizeOld = viewerOldListSnapshot.size();
                     int forceSize = getForceContainerSize(loggingChestIdViewer);
 
-                    if (forceSize < sizeOld) {
+                    if (forceSize >= 0 && forceSize < sizeOld) {
                         ItemStack[] containerState = ItemUtils.getContainerState(inventoryData);
 
                         long snapshotMark = HopperTransactionUtils.getSnapshotMark(transactingChestId, loggingChestIdViewer, forceSize);
                         containerState = HopperTransactionUtils.applyPendingChanges(containerState, transactingChestId, snapshotMark);
 
-                        ItemStack[] previousState = viewerOldList.get(forceSize);
+                        ItemStack[] previousState = viewerOldListSnapshot.get(forceSize);
                         addForceContainer(loggingChestIdViewer, ItemUtils.getSharedContainerState(containerState, previousState));
                     }
                 }
             }
         }
-
         if (forceInventoryData == null && batchItem != null && HopperTransactionUtils.shouldForceBatchBoundary(transactingChestId, loggingChestId, batchItem)) {
             forceInventoryData = inventoryData;
         }

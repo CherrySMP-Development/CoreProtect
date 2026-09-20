@@ -1,16 +1,20 @@
 package net.coreprotect.command;
 
+import java.util.concurrent.CancellationException;
+
 import org.bukkit.command.CommandSender;
 
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Consumer;
 import net.coreprotect.database.Database;
+import net.coreprotect.database.DuckDBRecovery;
 import net.coreprotect.language.Phrase;
 import net.coreprotect.thread.NetworkHandler;
 import net.coreprotect.utility.Chat;
 import net.coreprotect.utility.Color;
 import net.coreprotect.utility.EntitySpawnTracking;
 import net.coreprotect.utility.ErrorReporter;
+import net.coreprotect.utility.LookupThrottle;
 
 public class ReloadCommand {
 
@@ -26,14 +30,10 @@ public class ReloadCommand {
                 Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.PURGE_IN_PROGRESS));
                 return;
             }
-            if (ConfigHandler.lookupThrottle.get(player.getName()) != null) {
-                Object[] lookupThrottle = ConfigHandler.lookupThrottle.get(player.getName());
-                if ((boolean) lookupThrottle[0] || ((System.currentTimeMillis() - (long) lookupThrottle[1])) < 100) {
-                    Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
-                    return;
-                }
+            if (!LookupThrottle.tryAcquire(player.getName(), 100)) {
+                Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.DATABASE_BUSY));
+                return;
             }
-            ConfigHandler.lookupThrottle.put(player.getName(), new Object[] { true, System.currentTimeMillis() });
 
             class BasicThread implements Runnable {
                 @Override
@@ -45,13 +45,19 @@ public class ReloadCommand {
                         ErrorReporter.report(e);
                     }
                     finally {
-                        ConfigHandler.lookupThrottle.put(player.getName(), new Object[] { false, System.currentTimeMillis() });
+                        LookupThrottle.release(player.getName());
                     }
                 }
             }
-            Runnable runnable = new BasicThread();
-            Thread thread = new Thread(runnable);
-            thread.start();
+            try {
+                Runnable runnable = new BasicThread();
+                Thread thread = new Thread(runnable);
+                thread.start();
+            }
+            catch (RuntimeException | Error e) {
+                LookupThrottle.release(player.getName());
+                throw e;
+            }
         }
         else {
             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.NO_PERMISSION));
@@ -59,7 +65,8 @@ public class ReloadCommand {
     }
 
     static synchronized boolean performReload(CommandSender player) throws InterruptedException {
-        boolean resumePersistence = !Consumer.isDatabaseReloadPaused();
+        final boolean resumePersistenceAfterCancellation = !Consumer.isDatabaseReloadPaused();
+        boolean resumePersistence = resumePersistenceAfterCancellation;
         Consumer.OperationStartResult startResult = Consumer.beginDatabaseReload();
         if (startResult != Consumer.OperationStartResult.STARTED) {
             Phrase phrase = startResult == Consumer.OperationStartResult.PURGE_RUNNING ? Phrase.PURGE_IN_PROGRESS
@@ -80,11 +87,21 @@ public class ReloadCommand {
                 return false;
             }
             resumePersistence = false;
-            if (!ConfigHandler.performInitialization(false)) {
+            boolean initialized;
+            try {
+                initialized = ConfigHandler.performInitialization(false);
+            }
+            catch (CancellationException e) {
+                resumePersistence = resumePersistenceAfterCancellation;
+                Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.RELOAD_FAILED));
+                return false;
+            }
+            if (!initialized) {
                 Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.RELOAD_FAILED));
                 return false;
             }
             EntitySpawnTracking.invalidateDatabaseVerification();
+            DuckDBRecovery.reset();
             resumePersistence = true;
             Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.RELOAD_SUCCESS));
 

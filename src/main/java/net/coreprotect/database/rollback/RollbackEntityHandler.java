@@ -173,8 +173,8 @@ public class RollbackEntityHandler {
     private static void removeEntity(Entity entity) {
         if (EntitySpawnTracking.isTrackedOrPendingIdentity(entity)) {
             EntityInteractionListener.flushPendingInteractions(entity);
-            Queue.queueEntitySpawnRemoved(entity.getUniqueId(), entity.getLocation());
-            EntitySpawnTracking.forget(entity.getUniqueId());
+            Queue.queueEntitySpawnRemoved(entity);
+            EntitySpawnTracking.clearTracking(entity.getUniqueId());
             EntitySpawnTracking.removeWithoutRemovalLog(entity);
         }
         else {

@@ -24,7 +24,7 @@ The default settings are suitable for most servers:
 ```yaml
 database-type: duckdb
 duckdb-memory-limit: 512MB
-duckdb-threads: 2
+duckdb-threads: 3
 duckdb-max-temp-directory-size: 10GB
 ```
 
@@ -49,7 +49,11 @@ clickhouse-tls: false
 
 Create the configured database first with a database engine that provides persistent UUID-backed table identities. `Atomic` is the normal choice for self-hosted ClickHouse and is the default there; for example, `CREATE DATABASE coreprotect ENGINE = Atomic`. CoreProtect checks this capability before creating any tables, then creates and validates its prefixed tables and views. The account needs permission to read `system.databases` and `system.tables`, create and read/write the CoreProtect objects, run mutations and partition drops, and drop or truncate purge-target tables. Server-wide database-creation permission is not required; `#optimize` additionally requires table optimization permission.
 
-Only one active CoreProtect installation may use each ClickHouse database and prefix. Keep `database-lock` enabled and preserve `plugins/CoreProtect/.clickhouse-writer` with the installation; never copy it to another active server. Replicated or distributed tables and multiple active writers are not supported.
+To share a ClickHouse database and prefix, disable `database-lock` on every installation. Use the same CoreProtect version and direct endpoint to one physical ClickHouse server, with separate CoreProtect data directories. Load balancing across independent nodes, replicated tables, and distributed tables are unsupported. Synchronize system clocks; events from different installations within the same second have no guaranteed order. Use globally unique world names unless their coordinate histories should be combined.
+
+Players must log in with a UUID before UUID-less activity under a changed or reassigned name. UUIDs preserve account IDs across name changes and distinguish successive owners of a reused name. Name lookups use the latest UUID-bearing observation; ownership is unspecified when observations conflict within one second. Simultaneous name changes are unsupported. Cached names from other servers may remain until the player is observed locally or CoreProtect reloads.
+
+Purges require `database-lock`. Stop all installations sharing the database and prefix, enable the lock on the installation performing the purge, then restart or reload it before purging. Also stop all installations before migration. Migration updates only the initiating installation's configuration; update the others before restarting them.
 
 ## Per-World Configuration
 

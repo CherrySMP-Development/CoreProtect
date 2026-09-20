@@ -6,11 +6,14 @@ import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 import org.bukkit.Location;
 import org.bukkit.inventory.ItemStack;
@@ -18,8 +21,14 @@ import org.bukkit.inventory.ItemStack;
 public final class HopperTransactionUtils {
 
     private static final long APPLY_ALL_MARK = -1L;
+    private static final int TRANSACTION_LOCK_COUNT = 256;
 
     private static final ConcurrentHashMap<String, PendingTransaction> pendingTransactions = new ConcurrentHashMap<>();
+    private static final Object[] transactionLocks = new Object[TRANSACTION_LOCK_COUNT];
+
+    static {
+        Arrays.setAll(transactionLocks, index -> new Object());
+    }
 
     private HopperTransactionUtils() {
         throw new IllegalStateException("Utility class");
@@ -47,6 +56,20 @@ public final class HopperTransactionUtils {
 
     public static String getHopperPullId(Location location) {
         return "#hopper-pull" + getLoggingIdSuffix(location);
+    }
+
+    public static void synchronizeTransaction(String transactionId, Runnable operation) {
+        Objects.requireNonNull(operation);
+        synchronized (getTransactionLock(transactionId)) {
+            operation.run();
+        }
+    }
+
+    public static <T> T synchronizeTransaction(String transactionId, Supplier<T> operation) {
+        Objects.requireNonNull(operation);
+        synchronized (getTransactionLock(transactionId)) {
+            return operation.get();
+        }
     }
 
     public static boolean hasTransaction(String transactionId) {
@@ -108,6 +131,10 @@ public final class HopperTransactionUtils {
     }
 
     public static void consumeSnapshot(String transactionId, String loggingId) {
+        consumeSnapshot(transactionId, loggingId, 0);
+    }
+
+    public static void consumeSnapshot(String transactionId, String loggingId, int index) {
         PendingTransaction transaction = pendingTransactions.get(transactionId);
         if (transaction == null) {
             return;
@@ -116,7 +143,16 @@ public final class HopperTransactionUtils {
         synchronized (transaction) {
             Deque<Long> marks = transaction.ownerMarks.get(loggingId);
             if (marks != null) {
-                marks.pollFirst();
+                if (index == 0) {
+                    marks.pollFirst();
+                }
+                else if (index > 0 && index < marks.size()) {
+                    Iterator<Long> iterator = marks.iterator();
+                    for (int position = 0; position <= index; position++) {
+                        iterator.next();
+                    }
+                    iterator.remove();
+                }
             }
 
             pruneDeltas(transaction);
@@ -258,6 +294,11 @@ public final class HopperTransactionUtils {
 
             transaction.deltas.addLast(new Delta(item.clone(), addBack, amount, transaction.nextSeq));
         }
+    }
+
+    private static Object getTransactionLock(String transactionId) {
+        Objects.requireNonNull(transactionId);
+        return transactionLocks[Math.floorMod(transactionId.hashCode(), TRANSACTION_LOCK_COUNT)];
     }
 
     private static void pruneDeltas(PendingTransaction transaction) {

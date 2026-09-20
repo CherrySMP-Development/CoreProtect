@@ -56,12 +56,12 @@ public class MessageAPI {
             }
 
             StringBuilder query = new StringBuilder("SELECT time," + ConfigHandler.databaseType.getUserColumn() + ",wid,x,y,z,message FROM ");
-            query.append(ConfigHandler.prefix).append(table).append(" ");
-            if (filter.hasLocation()) {
+            query.append(filter.table(connection, table, "")).append(' ');
+            if (filter.hasLocation() && !ConfigHandler.databaseType.isDuckDB()) {
                 query.append(WorldUtils.getWidIndex(table));
             }
             filter.appendWhere(query);
-            query.append(" ORDER BY rowid DESC");
+            query.append(" ORDER BY ").append(ConfigHandler.getDescendingEventOrder());
             filter.appendLimit(query);
 
             try (PreparedStatement statement = connection.prepareStatement(query.toString())) {

@@ -4,6 +4,8 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Properties;
 
+import com.clickhouse.client.api.ClientConfigProperties;
+
 public final class ClickHouseJdbcConfig {
 
     private static final String SERVER_SETTING_PREFIX = "clickhouse_setting_";
@@ -46,8 +48,10 @@ public final class ClickHouseJdbcConfig {
         properties.setProperty(SERVER_SETTING_PREFIX + "async_insert", "0");
         properties.setProperty(SERVER_SETTING_PREFIX + "do_not_merge_across_partitions_select_final", "1");
         properties.setProperty(SERVER_SETTING_PREFIX + "wait_end_of_query", "1");
+        properties.setProperty(SERVER_SETTING_PREFIX + "prefer_column_name_to_alias", "1");
         properties.setProperty("ssl", Boolean.toString(tls));
         properties.setProperty("jdbc_ignore_unsupported_values", "false");
+        properties.setProperty(ClientConfigProperties.BINARY_STRING_SUPPORT.getKey(), "true");
     }
 
     public String getJdbcUrl() {
@@ -72,6 +76,13 @@ public final class ClickHouseJdbcConfig {
 
     public ClickHouseJdbcConfig withDatabase(String database) {
         return new ClickHouseJdbcConfig(host, port, database, username, password, tls);
+    }
+
+    public ClickHouseJdbcConfig forMigrationReads() {
+        ClickHouseJdbcConfig config = new ClickHouseJdbcConfig(host, port, database, username, password, tls);
+        config.properties.setProperty("socket_timeout", "0");
+        config.properties.setProperty(SERVER_SETTING_PREFIX + "wait_end_of_query", "0");
+        return config;
     }
 
     public Properties getProperties() {

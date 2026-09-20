@@ -33,8 +33,8 @@ public final class TrackedEntityRemoveListener implements Listener {
         if (EntitySpawnTracking.isTrackedOrPendingIdentity(entity)) {
             InventoryChangeListener.flushEntityContainer(entity);
             EntityInteractionListener.flushPendingInteractions(entity);
-            Queue.queueEntitySpawnRemoved(entity.getUniqueId(), entity.getLocation());
-            EntitySpawnTracking.forget(entity.getUniqueId());
+            Queue.queueEntitySpawnRemoved(entity);
+            EntitySpawnTracking.clearTracking(entity.getUniqueId());
         }
     }
 }

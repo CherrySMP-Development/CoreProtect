@@ -56,6 +56,7 @@ Perform a lookup. Nearly all of the parameters are optional.
 | [`a:<action>`](#aaction) | Restrict the lookup to a certain action. |
 | [`i:<include>`](#iinclude) | Include specific blocks/entities in the lookup. |
 | [`e:<exclude>`](#eexclude) | Exclude blocks/entities from the lookup. |
+| [`f:<filter>`](#ffilter) | Include or exclude chat, command, or sign text by prefix. |
 | [`#<hashtag>`](#hashtag) | Add a hashtag to perform additional actions. |
 
 #### Pagination
@@ -139,7 +140,9 @@ Migrate data from the active database backend to a different backend. This is a 
 
 | Command | Parameters |
 | --- | --- |
-| /co migrate-db | `<sqlite|mysql|duckdb|clickhouse>` |
+| /co migrate-db | `<sqlite|mysql|duckdb|clickhouse> [--full-validation]` |
+
+By default, migration validates all table statistics and compares approximately 1% of each large history table, with full comparisons for small and reference tables. Add `--full-validation` to compare every copied row.
 
 The target namespace must contain no CoreProtect data; a DuckDB target must use a new database file, and `database-lock` must remain enabled. After a successful migration, CoreProtect automatically updates `database-type` in `config.yml` before queued writes resume.
 
@@ -239,6 +242,20 @@ ___
 
 ---
 
+### `f:<filter>`
+
+*Filter message prefixes when using `a:chat`, `a:command`, or `a:sign`.*
+
+* Example: `a:command f:/ban` *(commands starting with "/ban")*
+* Example: `a:command f:/ban,/kick` *(commands starting with either prefix)*
+* Example: `a:command f:/ban,-/banlist` *(include "/ban" and exclude "/banlist")*
+* Example: `a:chat f:-hello` *(exclude messages starting with "hello")*
+* Example: `a:sign f:Diamond Shop,-Diamond Shop Closed` *(filter prefixes on the recorded sign face)*
+
+> Separate filters with commas. Included prefixes are alternatives; any matching excluded prefix removes the result. Exclusions can be used on their own. Each prefix requires at least three characters, excluding the leading `-` marker. Spaces are allowed, and `*`, `%`, `_`, and `~` are matched literally.
+
+---
+
 ### `#<hashtag>`
 
 Add a hashtag to the end of your command to perform additional actions.
@@ -250,6 +267,7 @@ Add a hashtag to the end of your command to perform additional actions.
 | --- | --- |
 | `#preview` | Preview a rollback/restore |
 | `#count` | Return the number of rows found in a lookup query |
+| `#summary` | Return the row count and per-user material totals |
 | `#verbose` | Display additional information during a rollback/restore |
 | `#silent` | Display minimal information during a rollback/restore |
 
@@ -302,5 +320,7 @@ Lookup commands are generally the same as rollback commands. The primary differe
   *(lookup all logins ever done by Notch)*
 * `/co lookup u:Notch a:username`  
   *(lookup previous usernames used by Notch)*
+* `/co lookup r:50 t:7d a:block #summary`
+  *(show the matching row count and material totals for each user within the same area and time range)*
 
 ___

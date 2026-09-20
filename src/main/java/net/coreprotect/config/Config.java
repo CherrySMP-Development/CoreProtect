@@ -12,12 +12,15 @@ import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.regex.Pattern;
 
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 
 import net.coreprotect.CoreProtect;
+import net.coreprotect.consumer.Consumer;
 import net.coreprotect.language.Language;
 import net.coreprotect.thread.Scheduler;
 import net.coreprotect.utility.VersionUtils;
@@ -28,6 +31,7 @@ public class Config extends Language {
     private static final Map<String, String> DEFAULT_VALUES = new LinkedHashMap<>();
     private static final Map<String, Config> CONFIG_BY_WORLD_NAME = new HashMap<>();
     private static final String DEFAULT_FILE_HEADER = "# CoreProtect Config";
+    private static final Pattern NON_DIGIT_PATTERN = Pattern.compile("[^0-9]");
     public static final String LINE_SEPARATOR = "\n";
 
     private static final Config GLOBAL = new Config();
@@ -42,6 +46,7 @@ public class Config extends Language {
     public String CLICKHOUSE_PASSWORD;
     public String DUCKDB_MEMORY_LIMIT;
     public String DUCKDB_MAX_TEMP_DIRECTORY_SIZE;
+    public String SQLITE_DATABASE;
     public String PREFIX;
     public String MYSQL_HOST;
     public String MYSQL_DATABASE;
@@ -73,6 +78,7 @@ public class Config extends Language {
     public boolean NATURAL_BREAK;
     public boolean BLOCK_MOVEMENT;
     public boolean PISTONS;
+    public boolean DISPENSERS;
     public boolean BLOCK_BURN;
     public boolean BLOCK_IGNITE;
     public boolean FIRE_EXTINGUISH;
@@ -104,6 +110,7 @@ public class Config extends Language {
     public boolean WORLDEDIT;
     public int MAXIMUM_POOL_SIZE;
     public int CLICKHOUSE_PORT;
+    public int CLICKHOUSE_CONSUMER_DELAY;
     public int MYSQL_PORT;
     public int DEFAULT_RADIUS;
     public int DUCKDB_THREADS;
@@ -125,7 +132,7 @@ public class Config extends Language {
         DEFAULT_VALUES.put("clickhouse-password", "");
         DEFAULT_VALUES.put("clickhouse-tls", "false");
         DEFAULT_VALUES.put("duckdb-memory-limit", "512MB");
-        DEFAULT_VALUES.put("duckdb-threads", "2");
+        DEFAULT_VALUES.put("duckdb-threads", "3");
         DEFAULT_VALUES.put("duckdb-max-temp-directory-size", "10GB");
         DEFAULT_VALUES.put("language", "en");
         DEFAULT_VALUES.put("auto-purge", "false");
@@ -143,6 +150,7 @@ public class Config extends Language {
         DEFAULT_VALUES.put("natural-break", "true");
         DEFAULT_VALUES.put("block-movement", "true");
         DEFAULT_VALUES.put("pistons", "true");
+        DEFAULT_VALUES.put("dispensers", "true");
         DEFAULT_VALUES.put("block-burn", "true");
         DEFAULT_VALUES.put("block-ignite", "true");
         DEFAULT_VALUES.put("fire-extinguish", "false");
@@ -175,7 +183,7 @@ public class Config extends Language {
         HEADERS.put("donation-key", new String[] { "# CoreProtect is donationware. Obtain a donation key from coreprotect.net/donate/" });
         HEADERS.put("database-type", new String[] { "# Database engine used by CoreProtect. Valid values are duckdb, clickhouse, sqlite, and mysql.", "# Run /co reload or restart the server after changing the database engine or connection target." });
         HEADERS.put("mysql-host", new String[] { "# Connection settings for MySQL." });
-        HEADERS.put("clickhouse-host", new String[] { "# Connection settings for ClickHouse 25.6 or newer.", "# The configured database must already exist; CoreProtect creates its prefixed tables and views.", "# ClickHouse currently supports one CoreProtect installation per database and table prefix.", "# Preserve .clickhouse-writer with this installation and do not copy it to another active server." });
+        HEADERS.put("clickhouse-host", new String[] { "# Connection settings for ClickHouse 25.6 or newer.", "# The configured database must already exist; CoreProtect creates its prefixed tables and views.", "# Multiple writers require database-lock disabled, the same version and prefix, separate data directories, and direct connections to one physical server.", "# Keep writer clocks synchronized; a shared prefix is one logical namespace for worlds and players.", "# Do not reassign usernames, and record UUID-bearing logins before UUID-less activity under a changed name.", "# Stop every writer before migration or purge; purge requires database-lock on the remaining server.", "# Replicated, distributed, and load-balanced independent ClickHouse nodes are unsupported." });
         HEADERS.put("duckdb-memory-limit", new String[] { "# Resource limits for the embedded DuckDB database.", "# The memory limit controls DuckDB's buffer manager; the temporary limit caps spill data and is not preallocated." });
         HEADERS.put("language", new String[] { "# If modified, will automatically attempt to translate languages phrases.", "# List of language codes: https://coreprotect.net/languages/" });
         HEADERS.put("auto-purge", new String[] { "# Automatically purge data older than the configured time.", "# Examples: 30d, 12w, 6mo. Set to false to disable." });
@@ -193,6 +201,7 @@ public class Config extends Language {
         HEADERS.put("natural-break", new String[] { "# Logs blocks that break off of other blocks; for example, a sign or torch", "# falling off of a dirt block that a player breaks. This is required for", "# beds/doors to properly rollback." });
         HEADERS.put("block-movement", new String[] { "# Properly track block movement, such as sand or gravel falling." });
         HEADERS.put("pistons", new String[] { "# Properly track blocks moved by pistons." });
+        HEADERS.put("dispensers", new String[] { "# Logs block placement and removal events caused by dispensers." });
         HEADERS.put("block-burn", new String[] { "# Logs blocks that burn up in a fire." });
         HEADERS.put("block-ignite", new String[] { "# Logs when a block naturally ignites, such as from fire spreading." });
         HEADERS.put("fire-extinguish", new String[] { "# Logs when fire naturally extinguishes." });
@@ -239,6 +248,8 @@ public class Config extends Language {
         this.DATABASE_TYPE = this.getString("database-type");
         this.CLICKHOUSE_HOST = this.getString("clickhouse-host");
         this.CLICKHOUSE_PORT = this.getInt("clickhouse-port");
+        this.CLICKHOUSE_CONSUMER_DELAY = Math.max(500,
+                this.getInt("clickhouse-consumer-delay", 2500));
         this.CLICKHOUSE_DATABASE = this.getString("clickhouse-database");
         this.CLICKHOUSE_USERNAME = this.getString("clickhouse-username");
         this.CLICKHOUSE_PASSWORD = this.getString("clickhouse-password");
@@ -251,8 +262,9 @@ public class Config extends Language {
         this.MYSQL_USERNAME = this.getString("mysql-username");
         this.MYSQL_PASSWORD = this.getString("mysql-password");
         this.DUCKDB_MEMORY_LIMIT = this.getString("duckdb-memory-limit");
-        this.DUCKDB_THREADS = this.getInt("duckdb-threads", 2);
+        this.DUCKDB_THREADS = this.getInt("duckdb-threads", 3);
         this.DUCKDB_MAX_TEMP_DIRECTORY_SIZE = this.getString("duckdb-max-temp-directory-size");
+        this.SQLITE_DATABASE = this.getString("sqlite-database");
         this.LANGUAGE = this.getString("language");
         this.AUTO_PURGE = this.getString("auto-purge");
         this.AUTO_PURGE_TIME = this.getString("auto-purge-time");
@@ -270,6 +282,7 @@ public class Config extends Language {
         this.NATURAL_BREAK = this.getBoolean("natural-break");
         this.BLOCK_MOVEMENT = this.getBoolean("block-movement");
         this.PISTONS = this.getBoolean("pistons");
+        this.DISPENSERS = this.getBoolean("dispensers");
         this.BLOCK_BURN = this.getBoolean("block-burn");
         this.BLOCK_IGNITE = this.getBoolean("block-ignite");
         this.FIRE_EXTINGUISH = this.getBoolean("fire-extinguish");
@@ -368,7 +381,7 @@ public class Config extends Language {
             return dfl;
         }
 
-        configured = configured.replaceAll("[^0-9]", "");
+        configured = NON_DIGIT_PATTERN.matcher(configured).replaceAll("");
 
         return configured.isEmpty() ? dfl : Integer.parseInt(configured);
     }
@@ -447,8 +460,12 @@ public class Config extends Language {
             // we call reloads asynchronously
             // for now this solution is good enough to ensure we only modify on the main thread
             final CompletableFuture<Void> complete = new CompletableFuture<>();
+            final CompletableFuture<Void> shutdown = Consumer.databaseReloadShutdownSignal();
 
             Scheduler.runTask(CoreProtect.getInstance(), () -> {
+                if (shutdown.isDone()) {
+                    return;
+                }
                 try {
                     parseConfig(data);
                 }
@@ -462,6 +479,11 @@ public class Config extends Language {
                 complete.complete(null);
             });
 
+            CompletableFuture.anyOf(complete, shutdown).join();
+            if (!complete.isDone()) {
+                complete.cancel(false);
+                throw new CancellationException("Configuration reload cancelled for shutdown");
+            }
             complete.join();
             return;
         }

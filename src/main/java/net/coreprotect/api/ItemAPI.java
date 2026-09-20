@@ -32,6 +32,10 @@ public class ItemAPI {
             return result;
         }
 
+        if (options == null) {
+            options = LookupOptions.builder().build();
+        }
+
         try (Connection connection = Database.getConnection(false, 1000)) {
             if (connection == null) {
                 return result;
@@ -43,18 +47,24 @@ public class ItemAPI {
             }
 
             StringBuilder query = new StringBuilder("SELECT time," + ConfigHandler.databaseType.getUserColumn() + ",wid,x,y,z,type,data,amount,action,rolled_back FROM ");
-            query.append(ConfigHandler.prefix).append("item ");
-            if (filter.hasLocation()) {
+            query.append(filter.table(connection, "item", "")).append(' ');
+            if (filter.hasLocation() && !ConfigHandler.databaseType.isDuckDB()) {
                 query.append(WorldUtils.getWidIndex("item"));
             }
             filter.appendWhere(query);
-            query.append(" AND action NOT IN (")
-                    .append(ItemLogger.ITEM_BREAK).append(",")
-                    .append(ItemLogger.ITEM_DESTROY).append(",")
-                    .append(ItemLogger.ITEM_CREATE).append(",")
-                    .append(ItemLogger.ITEM_SELL).append(",")
-                    .append(ItemLogger.ITEM_BUY).append(")");
-            query.append(" ORDER BY rowid DESC");
+            filter.appendMaterialWhere(query);
+            if (options.getItemActions().isEmpty()) {
+                query.append(" AND action NOT IN (")
+                        .append(ItemLogger.ITEM_BREAK).append(",")
+                        .append(ItemLogger.ITEM_DESTROY).append(",")
+                        .append(ItemLogger.ITEM_CREATE).append(",")
+                        .append(ItemLogger.ITEM_SELL).append(",")
+                        .append(ItemLogger.ITEM_BUY).append(")");
+            }
+            else {
+                LookupFilter.appendActionWhere(query, "", options.getItemActions().stream().mapToInt(ItemAction::id).toArray());
+            }
+            query.append(" ORDER BY ").append(ConfigHandler.getDescendingEventOrder());
             filter.appendLimit(query);
 
             try (PreparedStatement statement = connection.prepareStatement(query.toString())) {

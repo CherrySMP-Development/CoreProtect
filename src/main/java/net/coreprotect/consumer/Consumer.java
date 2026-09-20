@@ -5,7 +5,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.bukkit.Bukkit;
@@ -15,6 +18,8 @@ import org.bukkit.inventory.ItemStack;
 import net.coreprotect.CoreProtect;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.process.Process;
+import net.coreprotect.database.Database;
+import net.coreprotect.database.DuckDBRecovery;
 import net.coreprotect.language.Phrase;
 import net.coreprotect.utility.Chat;
 import net.coreprotect.utility.Color;
@@ -39,6 +44,8 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
     private static volatile boolean backgroundPurgePausesPersistence = false;
     private static volatile boolean databaseReloadPaused = false;
     private static volatile boolean databaseReloadRunning = false;
+    private static volatile boolean databaseReloadBlockedForShutdown = false;
+    private static CompletableFuture<Void> databaseReloadShutdownSignal = new CompletableFuture<>();
     public static volatile int currentConsumer = 0;
     public static volatile boolean isPaused = false;
     public static volatile boolean transacting = false;
@@ -114,11 +121,16 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
         synchronized (rollbackPurgeGate) {
             persistenceHalted = false;
             pendingRollbackPublications = 0;
+            databaseReloadBlockedForShutdown = false;
+            databaseReloadShutdownSignal.complete(null);
+            databaseReloadShutdownSignal = new CompletableFuture<>();
         }
         databaseReloadPaused = false;
         databaseReloadRunning = false;
         backgroundPurgeRunning = false;
         backgroundPurgePausesPersistence = false;
+        resetPreparationFailures();
+        DuckDBRecovery.reset();
         Consumer.consumer.put(0, new ArrayList<>());
         Consumer.consumer.put(1, new ArrayList<>());
         Consumer.consumer_id.put(0, new Integer[] { 0, 0 });
@@ -194,7 +206,18 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
     }
 
     public static OperationStartResult beginDatabaseReload() {
+        return beginDatabaseReload(false);
+    }
+
+    public static OperationStartResult beginDatabaseRecovery() {
+        return beginDatabaseReload(true);
+    }
+
+    private static OperationStartResult beginDatabaseReload(boolean allowActiveRollbacks) {
         synchronized (rollbackPurgeGate) {
+            if (databaseReloadBlockedForShutdown) {
+                return OperationStartResult.INTERRUPTED;
+            }
             if (persistenceHalted) {
                 return OperationStartResult.PERSISTENCE_HALTED;
             }
@@ -204,13 +227,26 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
             if (ConfigHandler.purgeRunning || backgroundPurgeRunning) {
                 return OperationStartResult.PURGE_RUNNING;
             }
-            if (!ConfigHandler.activeRollbacks.isEmpty() || pendingRollbackPublications > 0) {
+            if (!allowActiveRollbacks && (!ConfigHandler.activeRollbacks.isEmpty() || pendingRollbackPublications > 0)) {
                 return OperationStartResult.ROLLBACK_RUNNING;
             }
             databaseReloadRunning = true;
             databaseReloadPaused = true;
         }
         return OperationStartResult.STARTED;
+    }
+
+    public static void blockDatabaseReloadForShutdown() {
+        synchronized (rollbackPurgeGate) {
+            databaseReloadBlockedForShutdown = true;
+            databaseReloadShutdownSignal.complete(null);
+        }
+    }
+
+    public static CompletableFuture<Void> databaseReloadShutdownSignal() {
+        synchronized (rollbackPurgeGate) {
+            return databaseReloadShutdownSignal.copy();
+        }
     }
 
     public static void lockDatabaseReload() {
@@ -223,19 +259,19 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
 
     public static void endDatabaseReload(boolean resumePersistence) {
         try {
+            if (databaseLifecycle.isWriteLockedByCurrentThread()) {
+                databaseLifecycle.writeLock().unlock();
+            }
+        }
+        finally {
             synchronized (rollbackPurgeGate) {
-                databaseReloadRunning = false;
                 if (resumePersistence) {
                     databaseReloadPaused = false;
                     if (!ConfigHandler.converterRunning) {
                         isPaused = false;
                     }
                 }
-            }
-        }
-        finally {
-            if (databaseLifecycle.isWriteLockedByCurrentThread()) {
-                databaseLifecycle.writeLock().unlock();
+                databaseReloadRunning = false;
             }
         }
     }
@@ -418,9 +454,33 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
         pausedSuccess = false;
     }
 
+    static void processConsumerBatch(int processId, boolean lastRun) throws InterruptedException {
+        Lock databaseLock = databaseLifecycle.readLock();
+        databaseLock.lock();
+        try {
+            boolean exclusive = requiresEntityUuidMaintenance(processId);
+            if (exclusive) {
+                databaseLock.unlock();
+                databaseLock = databaseLifecycle.writeLock();
+                databaseLock.lock();
+            }
+            if (databaseReloadPaused || isPaused || persistenceHalted) {
+                return;
+            }
+            if (exclusive && !Database.awaitConnectionDrain(0L)) {
+                return;
+            }
+            Process.processConsumer(processId, lastRun);
+        }
+        finally {
+            databaseLock.unlock();
+        }
+    }
+
     @Override
     public void run() {
         boolean lastRun = false;
+        boolean[] drained = { true, true };
 
         while (ConfigHandler.serverRunning || ConfigHandler.converterRunning || !lastRun) {
             if (!ConfigHandler.serverRunning && !ConfigHandler.converterRunning) {
@@ -428,11 +488,23 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
             }
             if (persistenceHalted) {
                 if (!lastRun) {
-                    errorDelay();
+                    if (databaseReloadBlockedForShutdown) {
+                        LockSupport.parkNanos(100_000_000L);
+                    }
+                    else {
+                        errorDelay();
+                    }
                 }
                 continue;
             }
             try {
+                if (DuckDBRecovery.isPending()) {
+                    DuckDBRecovery.recoverIfRequested();
+                    if (DuckDBRecovery.isPending()) {
+                        Thread.sleep(500L);
+                        continue;
+                    }
+                }
                 int process_id = 0;
                 synchronized (Consumer.consumer_id) {
                     if (currentConsumer == 0) {
@@ -443,16 +515,13 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
                         currentConsumer = 0;
                     }
                 }
-                Thread.sleep(500);
+                Thread.sleep(consumerDelay(lastRun || !drained[0] || !drained[1]));
                 pauseConsumer(process_id);
-                databaseLifecycle.readLock().lock();
                 try {
-                    if (!databaseReloadPaused && !isPaused && !persistenceHalted) {
-                        Process.processConsumer(process_id, lastRun);
-                    }
+                    processConsumerBatch(process_id, lastRun);
                 }
                 finally {
-                    databaseLifecycle.readLock().unlock();
+                    drained[process_id] = getConsumerSize(process_id) == 0;
                 }
             }
             catch (Exception e) {

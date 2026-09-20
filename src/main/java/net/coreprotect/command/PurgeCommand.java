@@ -16,6 +16,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -322,6 +323,7 @@ public class PurgeCommand extends Consumer {
                 boolean consumerPaused = false;
                 boolean duckTransaction = false;
                 boolean duckPurgeStarted = false;
+                AtomicBoolean duckCommitAttempted = new AtomicBoolean();
                 boolean duckRollbackSucceeded = false;
                 boolean maintenanceLocked = false;
                 boolean resumePersistence = true;
@@ -418,8 +420,9 @@ public class PurgeCommand extends Consumer {
                     String purgePrefix = "tmp_" + ConfigHandler.prefix;
 
                     if (ConfigHandler.databaseType.isSQLite()) {
-                        query = "ATTACH DATABASE '" + ConfigHandler.path + ConfigHandler.sqlite + ".tmp' AS tmp_db";
+                        query = "ATTACH DATABASE ? AS tmp_db";
                         preparedStmt = preparePurgeStatement(connection, query);
+                        preparedStmt.setString(1, ConfigHandler.path + ConfigHandler.sqlite + ".tmp");
                         preparedStmt.execute();
                         preparedStmt.close();
                         purgePrefix = "tmp_db." + ConfigHandler.prefix;
@@ -729,11 +732,12 @@ public class PurgeCommand extends Consumer {
                     if (duckTransaction) {
                         activePurgeStatement = transactionStatement;
                         requirePurgeNotCancelled();
-                        if (!Database.commitTransactionChecked(transactionStatement, ConfigHandler.databaseType)) {
+                        if (!Database.commitTransactionChecked(transactionStatement, ConfigHandler.databaseType, () -> duckCommitAttempted.set(true))) {
                             throw new SQLException("Unable to commit DuckDB purge transaction");
                         }
                         duckTransaction = false;
                         duckPurgeStarted = false;
+                        duckCommitAttempted.set(false);
                         requirePurgeNotCancelled();
                         try {
                             transactionStatement.execute("CHECKPOINT");
@@ -797,7 +801,7 @@ public class PurgeCommand extends Consumer {
                     if (duckTransaction && transactionStatement != null) {
                         duckRollbackSucceeded = Database.rollbackTransaction(transactionStatement, ConfigHandler.databaseType);
                     }
-                    if (ConfigHandler.databaseType.isDuckDB() && duckPurgeStarted && !duckRollbackSucceeded) {
+                    if (ConfigHandler.databaseType.isDuckDB() && requiresDuckDatabaseReload(duckPurgeStarted, duckCommitAttempted.get(), duckRollbackSucceeded)) {
                         Consumer.requireDatabaseReload();
                         ConfigHandler.databaseReachable = false;
                         resumePersistence = false;
@@ -860,6 +864,10 @@ public class PurgeCommand extends Consumer {
 
     private static Path sqliteTempDatabase() {
         return Path.of(ConfigHandler.path + ConfigHandler.sqlite + ".tmp");
+    }
+
+    static boolean requiresDuckDatabaseReload(boolean purgeStarted, boolean commitAttempted, boolean rollbackSucceeded) {
+        return purgeStarted && (commitAttempted || !rollbackSucceeded);
     }
 
     private static void replaceSQLiteDatabase() throws IOException {

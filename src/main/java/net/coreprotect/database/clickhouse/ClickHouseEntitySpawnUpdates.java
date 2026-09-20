@@ -21,9 +21,11 @@ import org.bukkit.Location;
 import net.coreprotect.database.ConsumerEntitySpawnUpdates;
 import net.coreprotect.database.Database;
 import net.coreprotect.database.EntitySpawnUpdateCoordinator;
+import net.coreprotect.database.statement.EntitySpawnStatement;
 import net.coreprotect.model.action.LookupActions;
 import net.coreprotect.model.entity.EntityContainerRollbackUpdate;
 import net.coreprotect.model.entity.EntitySpawnData;
+import net.coreprotect.model.entity.EntitySpawnIdentity;
 import net.coreprotect.utility.DatabaseUtils;
 import net.coreprotect.utility.ErrorReporter;
 import net.coreprotect.utility.WorldUtils;
@@ -33,7 +35,7 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
     private static final int SELECT_BATCH_SIZE = 500;
     private static final String COLUMNS = "rowid,if(block_rowid_present=1,block_rowid,NULL) AS block_rowid,if(kill_rowid_present=1,kill_rowid,NULL) AS kill_rowid,uuid,current_wid,current_x,current_y,current_z,yaw,pitch,"
             + ClickHouseSchema.binary("if(entity_data_present=1,entity_data,NULL)", "data")
-            + ",removed,producer_id,producer_sequence,batch_ordinal,time,wid,x AS key_x,z AS key_z";
+            + ",removed,batch_sequence,batch_ordinal,time,wid,x AS key_x,z AS key_z";
 
     private final ClickHouseConsumerWriteBatch owner;
     private final String eventTable;
@@ -144,21 +146,23 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
         }
     }
 
-    void checkpointLocation(int trackingRowId, int worldId, double x, double y, double z, float yaw, float pitch) throws Exception {
+    boolean checkpointLocation(int trackingRowId, int worldId, double x, double y, double z, float yaw, float pitch) throws Exception {
         ClickHouseEntityState state = requireState(trackingRowId);
         if (state.isRemoved()) {
-            return;
+            return false;
         }
         append(trackingRowId, state.withLocation(worldId, x, y, z, yaw, pitch));
+        return true;
     }
 
     @Override
-    public void apply(EntitySpawnData data) {
+    public EntitySpawnIdentity apply(EntitySpawnData data) {
         Objects.requireNonNull(data, "data");
         ensureOpen();
         if (!coordinator.begin(data)) {
-            return;
+            return null;
         }
+        EntitySpawnIdentity createdIdentity = null;
         try {
             switch (data.getOperation()) {
                 case VERIFY:
@@ -168,7 +172,7 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
                     updateLocation(data);
                     break;
                 case REMOVED:
-                    remove(data);
+                    createdIdentity = remove(data);
                     break;
                 case REVIVED:
                     revive(data);
@@ -187,6 +191,7 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
             coordinator.failed(data);
             Database.handleWriteFailure(exception);
         }
+        return createdIdentity;
     }
 
     @Override
@@ -214,8 +219,19 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
     }
 
     @Override
+    public void identityFound(UUID uuid) {
+        coordinator.entityFound(uuid);
+    }
+
+    @Override
     public void afterCommit(boolean committed) {
         coordinator.afterCommit(committed);
+        clearStateCache();
+    }
+
+    @Override
+    public void afterRetain() {
+        coordinator.afterRetain();
         clearStateCache();
     }
 
@@ -250,7 +266,7 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
 
     private void verify(EntitySpawnData data) throws Exception {
         if (findByUuid(data.getUuid(), false) == null) {
-            coordinator.verificationMissing(data.getUuid());
+            coordinator.verificationMissing(data);
         }
         else {
             coordinator.verificationFound(data);
@@ -260,18 +276,23 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
     private void updateLocation(EntitySpawnData data) throws Exception {
         ClickHouseEntityState state = findByUuid(data.getUuid(), false);
         if (state == null) {
-            coordinator.locationMissing(data.getUuid());
+            coordinator.locationMissing(data);
             return;
         }
         append(toTrackingRowId(state.getPointer().getRowId()), withLocation(state, data.getLocation()));
         coordinator.locationFound(data);
     }
 
-    private void remove(EntitySpawnData data) throws Exception {
+    private EntitySpawnIdentity remove(EntitySpawnData data) throws Exception {
         ClickHouseEntityState state = findByUuid(data.getUuid(), false);
         if (state != null) {
             append(toTrackingRowId(state.getPointer().getRowId()), withLocation(state, data.getLocation()).withData(null).withRemoved(true));
+            return null;
         }
+        if (findByUuid(data.getUuid(), true) != null) {
+            return null;
+        }
+        return EntitySpawnStatement.insertTerminalIdentity(owner, data);
     }
 
     private void revive(EntitySpawnData data) throws Exception {
@@ -473,12 +494,11 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
                 for (int ignored = 0; ignored < batch.size(); ignored++) {
                     placeholders.add("?");
                 }
-                String sql = "SELECT " + COLUMNS + " FROM " + eventTable + " FINAL WHERE dataset_id=? AND family=? AND " + column + " IN(" + placeholders + ")" + additionalFilter;
+                String sql = "SELECT " + COLUMNS + " FROM " + eventTable + " FINAL WHERE family=? AND " + column + " IN(" + placeholders + ")" + additionalFilter;
                 try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                    statement.setObject(1, datasetId);
-                    statement.setString(2, ClickHouseFamily.ENTITY_SPAWN.getTableName());
+                    statement.setString(1, ClickHouseFamily.ENTITY_SPAWN.getTableName());
                     for (int index = 0; index < batch.size(); index++) {
-                        statement.setObject(index + 3, batch.get(index));
+                        statement.setObject(index + 2, batch.get(index));
                     }
                     try (ResultSet resultSet = statement.executeQuery()) {
                         while (resultSet.next()) {
@@ -519,8 +539,9 @@ final class ClickHouseEntitySpawnUpdates implements ConsumerEntitySpawnUpdates {
 
     private ClickHouseEntityState readState(ResultSet resultSet) throws Exception {
         int rowId = resultSet.getInt("rowid");
-        ClickHouseEventPointer pointer = new ClickHouseEventPointer(datasetId, ClickHouseFamily.ENTITY_SPAWN, UUID.fromString(resultSet.getString("producer_id")), resultSet.getLong("producer_sequence"), resultSet.getInt("batch_ordinal"), rowId, resultSet.getInt("time"), resultSet.getInt("wid"), resultSet.getInt("key_x"), resultSet.getInt("key_z"));
-        return new ClickHouseEntityState(pointer, nullableLong(resultSet, "block_rowid"), nullableInteger(resultSet, "kill_rowid"), UUID.fromString(resultSet.getString("uuid")), resultSet.getInt("current_wid"), resultSet.getDouble("current_x"), resultSet.getDouble("current_y"), resultSet.getDouble("current_z"), resultSet.getFloat("yaw"), resultSet.getFloat("pitch"), DatabaseUtils.getBytes(resultSet, "data"), resultSet.getInt("removed") == 1);
+        ClickHouseEventPointer pointer = new ClickHouseEventPointer(datasetId, ClickHouseFamily.ENTITY_SPAWN, resultSet.getLong("batch_sequence"), resultSet.getInt("batch_ordinal"), rowId, resultSet.getInt("time"), resultSet.getInt("wid"), resultSet.getInt("key_x"), resultSet.getInt("key_z"));
+        byte[] data = DatabaseUtils.getBytes(resultSet, "data");
+        return new ClickHouseEntityState(pointer, nullableLong(resultSet, "block_rowid"), nullableInteger(resultSet, "kill_rowid"), UUID.fromString(resultSet.getString("uuid")), resultSet.getInt("current_wid"), resultSet.getDouble("current_x"), resultSet.getDouble("current_y"), resultSet.getDouble("current_z"), resultSet.getFloat("yaw"), resultSet.getFloat("pitch"), data, resultSet.getInt("removed") == 1);
     }
 
     private void append(int trackingRowId, ClickHouseEntityState state) throws SQLException {

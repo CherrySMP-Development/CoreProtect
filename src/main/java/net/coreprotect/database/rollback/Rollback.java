@@ -41,6 +41,7 @@ import net.coreprotect.model.action.EntityActionFilter;
 import net.coreprotect.model.action.LookupActions;
 import net.coreprotect.model.entity.EntitySpawnRecord;
 import net.coreprotect.model.item.InventorySources;
+import net.coreprotect.model.lookup.EntityLookupContext;
 import net.coreprotect.model.rollback.RollbackUpdateTargets;
 import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.thread.Scheduler;
@@ -72,19 +73,36 @@ public class Rollback extends RollbackUtil {
         try {
             long timeStart = System.currentTimeMillis();
             List<Object[]> lookupList = new ArrayList<>();
-            Set<UUID> loadedEntityUuids = Collections.emptySet();
-            Set<UUID> loadedEntityCandidates = Collections.emptySet();
+            EntityLookupContext entityContext = EntityLookupContext.legacy(Collections.emptySet(), Collections.emptySet());
             Integer exactEntityContainerId = user == null || !actionList.contains(5) ? null : ConfigHandler.lookupEntityContainer.get(user.getName());
+            boolean rollbackContainerItems = false;
+            List<Object> itemRestrictList = new ArrayList<>(restrictList);
+            Map<Object, Boolean> itemExcludeList = new HashMap<>(excludeList);
+            if (actionList.contains(LookupActions.BLOCK_PLACE)) {
+                for (Object target : restrictList) {
+                    if (target instanceof Material && !excludeList.containsKey(target) && BlockGroup.CONTAINERS.contains(target)) {
+                        rollbackContainerItems = true;
+                        itemRestrictList.clear();
+                        itemExcludeList.clear();
+                        break;
+                    }
+                }
+            }
+            boolean includeItemLookup = exactEntityContainerId == null && Config.getGlobal().ROLLBACK_ITEMS && !checkUsers.contains("#container")
+                    && (actionList.isEmpty() || actionList.contains(LookupActions.CONTAINER) || rollbackContainerItems) && preview == 0;
+            boolean entityLocationsReconciled = false;
 
             if ((!actionList.contains(LookupActions.CONTAINER) && !actionList.contains(5) && !checkUsers.contains("#container")) || exactEntityContainerId != null) {
                 boolean includeEntitySpawns = entityActionFilter.includesAnySpawn(actionList, Config.getGlobal().ROLLBACK_ENTITIES);
-                if (!lookup && rollbackType == 0 && radius != null && includeEntitySpawns) {
-                    Set<UUID> databaseCandidates = EntitySpawnStatement.loadActiveUuids(statement.getConnection(), location, radius, startTime, endTime);
+                if (!ConfigHandler.databaseType.isDuckDB() && !lookup && rollbackType == 0 && radius != null && includeEntitySpawns) {
+                    Set<UUID> databaseCandidates = includeItemLookup
+                            ? EntitySpawnStatement.loadActiveUuids(statement.getConnection(), location, radius)
+                            : EntitySpawnStatement.loadActiveUuids(statement.getConnection(), location, radius, startTime, endTime);
                     EntitySpawnTracking.LoadedEntityRadius loadedEntities = EntitySpawnTracking.findLoadedEntities(location, radius, databaseCandidates);
-                    loadedEntityUuids = loadedEntities.getInside();
-                    loadedEntityCandidates = loadedEntities.getLoadedCandidates();
+                    entityContext = EntityLookupContext.legacy(loadedEntities.getInside(), loadedEntities.getLoadedCandidates());
+                    entityLocationsReconciled = true;
                 }
-                lookupList = Lookup.performLookupRaw(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, loadedEntityUuids, loadedEntityCandidates, location, radius, null, startTime, endTime, -1, -1, restrictWorld, lookup, exactEntityContainerId);
+                lookupList = Lookup.performLookupRaw(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, entityContext, location, radius, null, startTime, endTime, -1, -1, restrictWorld, lookup, exactEntityContainerId);
             }
 
             if (lookupList == null) {
@@ -130,14 +148,13 @@ public class Rollback extends RollbackUtil {
             }
             Map<Integer, EntitySpawnRecord> entityKillRecords = EntitySpawnStatement.loadRecordsByKillRowIds(statement.getConnection(), entityKillRowIds);
             if (!entityKillRecords.isEmpty()) {
-                Iterator<Object[]> iterator = rollbackLookupList.iterator();
-                while (iterator.hasNext()) {
-                    Object[] row = iterator.next();
+                rollbackLookupList.removeIf(row -> {
                     if ((Integer) row[8] == LookupActions.ENTITY_KILL && entityKillRecords.containsKey((Integer) row[7])) {
                         trackedKillList.add(row);
-                        iterator.remove();
+                        return true;
                     }
-                }
+                    return false;
+                });
             }
             Map<Integer, List<Object>> entityKillData = new HashMap<>();
             if (rollbackType == 0 && !trackedKillList.isEmpty()) {
@@ -155,27 +172,8 @@ public class Rollback extends RollbackUtil {
                 }
             }
 
-            boolean ROLLBACK_ITEMS = false;
-            List<Object> itemRestrictList = new ArrayList<>(restrictList);
-            Map<Object, Boolean> itemExcludeList = new HashMap<>(excludeList);
-
-            if (actionList.contains(LookupActions.BLOCK_PLACE)) {
-                for (Object target : restrictList) {
-                    if (target instanceof Material) {
-                        if (!excludeList.containsKey(target)) {
-                            if (BlockGroup.CONTAINERS.contains(target)) {
-                                ROLLBACK_ITEMS = true;
-                                itemRestrictList.clear();
-                                itemExcludeList.clear();
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
             List<Object[]> itemList = new ArrayList<>();
-            if (exactEntityContainerId == null && Config.getGlobal().ROLLBACK_ITEMS && !checkUsers.contains("#container") && (actionList.size() == 0 || actionList.contains(LookupActions.CONTAINER) || ROLLBACK_ITEMS) && preview == 0) {
+            if (includeItemLookup) {
                 List<Integer> itemActionList = new ArrayList<>(actionList);
 
                 if (!itemActionList.contains(LookupActions.CONTAINER)) {
@@ -183,21 +181,18 @@ public class Rollback extends RollbackUtil {
                 }
 
                 itemExcludeList.entrySet().removeIf(entry -> Boolean.TRUE.equals(entry.getValue()));
-                if (!lookup && radius != null) {
+                if (!ConfigHandler.databaseType.isDuckDB() && !lookup && radius != null && !entityLocationsReconciled) {
                     Set<UUID> databaseCandidates = EntitySpawnStatement.loadActiveUuids(statement.getConnection(), location, radius);
                     EntitySpawnTracking.LoadedEntityRadius loadedEntities = EntitySpawnTracking.findLoadedEntities(location, radius, databaseCandidates);
-                    loadedEntityUuids = loadedEntities.getInside();
-                    loadedEntityCandidates = loadedEntities.getLoadedCandidates();
+                    entityContext = EntityLookupContext.legacy(loadedEntities.getInside(), loadedEntities.getLoadedCandidates());
                 }
-                itemList = Lookup.performLookupRaw(statement, user, checkUuids, checkUsers, itemRestrictList, itemExcludeList, excludeUserList, itemActionList, EntityActionFilter.DEFAULT, loadedEntityUuids, loadedEntityCandidates, location, radius, null, startTime, endTime, -1, -1, restrictWorld, lookup);
+                itemList = Lookup.performLookupRaw(statement, user, checkUuids, checkUsers, itemRestrictList, itemExcludeList, excludeUserList, itemActionList, EntityActionFilter.DEFAULT, entityContext, location, radius, null, startTime, endTime, -1, -1, restrictWorld, lookup, null);
                 if (itemList == null) {
                     sendAborted(user);
                     return null;
                 }
 
-                Iterator<Object[]> itemIterator = itemList.iterator();
-                while (itemIterator.hasNext()) {
-                    Object[] row = itemIterator.next();
+                itemList.removeIf(row -> {
                     if (row.length > 15 && row[14] instanceof Integer && (Integer) row[14] == InventorySources.ENTITY_CONTAINER) {
                         if (inventoryRollback) {
                             entityContainerInventoryTrackingRowIds.add((Integer) row[15]);
@@ -205,10 +200,11 @@ public class Rollback extends RollbackUtil {
                         else {
                             entityContainerList.add(row);
                             entityContainerTrackingRowIds.add((Integer) row[15]);
-                            itemIterator.remove();
+                            return true;
                         }
                     }
-                }
+                    return false;
+                });
             }
             itemList.addAll(entityContainerInventoryList);
             if (inventoryRollback && !entityContainerInventoryTrackingRowIds.isEmpty()) {
@@ -228,6 +224,7 @@ public class Rollback extends RollbackUtil {
             TreeMap<Long, Integer> chunkList = new TreeMap<>();
             HashMap<Integer, HashMap<Long, ArrayList<Object[]>>> dataList = new HashMap<>();
             HashMap<Integer, HashMap<Long, ArrayList<Object[]>>> itemDataList = new HashMap<>();
+            Set<Integer> inventoryUserUuids = new HashSet<>();
             int listC = 0;
             while (listC < 2) {
                 List<Object[]> scanList = rollbackLookupList;
@@ -255,7 +252,10 @@ public class Rollback extends RollbackUtil {
                         chunkList.put(chunkKey, distance);
                     }
 
-                    UserStatement.getName(statement.getConnection(), userId);
+                    String rowUser = UserStatement.getName(statement.getConnection(), userId);
+                    if (inventoryRollback && inventoryUserUuids.add(userId) && rowUser != null && !rowUser.isEmpty()) {
+                        UserStatement.getUuid(statement.getConnection(), rowUser);
+                    }
 
                     HashMap<Integer, HashMap<Long, ArrayList<Object[]>>> modifyList = dataList;
                     if (listC == 1) {

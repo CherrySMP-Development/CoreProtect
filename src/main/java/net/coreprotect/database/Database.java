@@ -30,6 +30,7 @@ import net.coreprotect.consumer.process.Process;
 import net.coreprotect.database.clickhouse.ClickHouseConsumerWriteBatch;
 import net.coreprotect.database.clickhouse.ClickHouseDatabase;
 import net.coreprotect.database.clickhouse.ClickHouseJdbcConfig;
+import net.coreprotect.database.statement.UserStatement;
 import net.coreprotect.language.Phrase;
 import net.coreprotect.listener.player.InventoryChangeListener;
 import net.coreprotect.model.BlockGroup;
@@ -63,6 +64,7 @@ public class Database extends Queue {
     public static final int DATABASE_LOCK_INACTIVE = 0;
     public static final int DATABASE_LOCK_ACTIVE = 1;
     public static final int DATABASE_LOCK_MIGRATION_INCOMPLETE = 2;
+    public static final int DUCKDB_BLOCK_SIZE = 128 * 1024;
 
     private static final int ROLLED_BACK_UPDATE_BATCH_SIZE = 1000;
     private static final int DUCKDB_ROLLED_BACK_UPDATE_BATCH_SIZE = 5000;
@@ -140,6 +142,10 @@ public class Database extends Queue {
     }
 
     public static boolean commitTransactionChecked(Statement statement, DatabaseType databaseType) throws Exception {
+        return commitTransactionChecked(statement, databaseType, null);
+    }
+
+    public static boolean commitTransactionChecked(Statement statement, DatabaseType databaseType, Runnable onCommitAttempt) throws Exception {
         rejectClickHouseTransaction(databaseType);
         if (TRANSACTION_ROLLBACK_ONLY.get()) {
             if (databaseType.isDuckDB() && TRANSACTION_ROLLBACK_ACKNOWLEDGED.get()) {
@@ -154,21 +160,27 @@ public class Database extends Queue {
             try {
                 if (databaseType.isDuckDB()) {
                     Connection connection = statement.getConnection();
+                    if (onCommitAttempt != null) {
+                        onCommitAttempt.run();
+                    }
                     connection.commit();
                     try {
                         connection.setAutoCommit(true);
                     }
                     catch (Exception cleanupException) {
-                        ErrorReporter.report(cleanupException);
+                        reportDatabaseFailure(cleanupException);
                         try {
                             connection.close();
                         }
                         catch (Exception closeException) {
-                            ErrorReporter.report(closeException);
+                            reportDatabaseFailure(closeException);
                         }
                     }
                 }
                 else {
+                    if (onCommitAttempt != null) {
+                        onCommitAttempt.run();
+                    }
                     statement.executeUpdate(databaseType.isMySQL() ? "COMMIT" : "COMMIT TRANSACTION");
                 }
                 Consumer.transacting = false;
@@ -184,7 +196,7 @@ public class Database extends Queue {
 
                     continue;
                 }
-                ErrorReporter.report(e);
+                reportDatabaseFailure(e);
                 Consumer.transacting = false;
                 Consumer.interrupt = false;
                 TRANSACTION_ROLLBACK_ONLY.remove();
@@ -212,12 +224,12 @@ public class Database extends Queue {
                     connection.setAutoCommit(true);
                 }
                 catch (Exception cleanupException) {
-                    ErrorReporter.report(cleanupException);
+                    reportDatabaseFailure(cleanupException);
                     try {
                         connection.close();
                     }
                     catch (Exception closeException) {
-                        ErrorReporter.report(closeException);
+                        reportDatabaseFailure(closeException);
                     }
                 }
             }
@@ -227,7 +239,7 @@ public class Database extends Queue {
             }
         }
         catch (Exception e) {
-            ErrorReporter.report(e);
+            reportDatabaseFailure(e);
         }
         finally {
             Consumer.transacting = false;
@@ -308,7 +320,7 @@ public class Database extends Queue {
             }
         }
         catch (Exception e) {
-            ErrorReporter.report(e);
+            reportDatabaseFailure(e);
         }
     }
 
@@ -318,12 +330,21 @@ public class Database extends Queue {
 
     public static void handleWriteFailure(Exception exception) {
         if (ConfigHandler.databaseType.isColumnar()) {
+            if (ConfigHandler.databaseType.isDuckDB()) {
+                DuckDBRecovery.request(exception);
+            }
             if (exception instanceof DatabaseWriteException) {
                 throw (DatabaseWriteException) exception;
             }
             throw new DatabaseWriteException(exception);
         }
         ErrorReporter.report(exception);
+    }
+
+    public static void reportDatabaseFailure(Throwable failure) {
+        if (!DuckDBRecovery.request(failure)) {
+            ErrorReporter.report(failure);
+        }
     }
 
     public static void containerBreakCheck(String user, Material type, Object container, ItemStack[] contents, Location location) {
@@ -419,7 +440,8 @@ public class Database extends Queue {
             if (ConfigHandler.databaseType.isColumnar()) {
                 ConfigHandler.databaseReachable = false;
             }
-            if (!ConfigHandler.databaseType.isClickHouse() || shouldReportClickHouseConnectionError()) {
+            boolean recoveryRequested = ConfigHandler.databaseType.isDuckDB() && DuckDBRecovery.request(e);
+            if (!recoveryRequested && (!ConfigHandler.databaseType.isClickHouse() || shouldReportClickHouseConnectionError())) {
                 ErrorReporter.report(e);
             }
         }
@@ -473,7 +495,7 @@ public class Database extends Queue {
                         exception.addSuppressed(closeException);
                     }
                     iterator.remove();
-                    ErrorReporter.report(exception);
+                    reportDatabaseFailure(exception);
                 }
             }
         }
@@ -587,6 +609,18 @@ public class Database extends Queue {
         return new RelationalConsumerWriteBatch(connection, ConfigHandler.databaseType);
     }
 
+    public static int nextClickHouseIdentifierId(ConsumerWriteBatch.ReferenceKind kind, String value, int currentMaximum) throws SQLException {
+        return requireClickHouseDatabase().nextIdentifierId(kind, value, currentMaximum);
+    }
+
+    public static String findClickHouseIdentifierValue(ConsumerWriteBatch.ReferenceKind kind, int id) throws SQLException {
+        return requireClickHouseDatabase().findIdentifierValue(kind, id);
+    }
+
+    public static int findClickHouseIdentifierId(ConsumerWriteBatch.ReferenceKind kind, String value) throws SQLException {
+        return requireClickHouseDatabase().findIdentifierId(kind, value);
+    }
+
     public static void recordDatabaseVersion(Statement statement, String version) throws SQLException {
         if (ConfigHandler.databaseType.isClickHouse()) {
             requireClickHouseDatabase().updateCoreVersion(version);
@@ -597,6 +631,9 @@ public class Database extends Queue {
     }
 
     public static long purgeClickHouse(long startTime, long endTime, int worldId, List<Integer> blockTypes, boolean optimize) throws SQLException {
+        if (!Config.getGlobal().DATABASE_LOCK) {
+            throw new SQLException("ClickHouse purge requires database-lock to be enabled and every other CoreProtect installation sharing the database and prefix to be stopped");
+        }
         return requireClickHouseDatabase().purge(startTime, endTime, worldId, blockTypes, optimize);
     }
 
@@ -604,30 +641,6 @@ public class Database extends Queue {
         ClickHouseDatabase database = clickHouseDatabase;
         if (database != null) {
             database.cancelPurge();
-        }
-    }
-
-    public static void performRolledBackUpdate(Statement statement, int rolledBack, List<Long> rowIds, int table) {
-        String tableName = getRolledBackTableName(table);
-
-        try {
-            int listSize = rowIds.size();
-            int batchSize = getRolledBackUpdateBatchSize();
-            for (int startIndex = 0; startIndex < listSize; startIndex += batchSize) {
-                int endIndex = Math.min(startIndex + batchSize, listSize);
-                StringBuilder query = new StringBuilder("UPDATE " + ConfigHandler.prefix + tableName + " SET rolled_back='" + rolledBack + "' WHERE rowid IN(");
-                for (int index = startIndex; index < endIndex; index++) {
-                    if (index > startIndex) {
-                        query.append(",");
-                    }
-                    query.append(rowIds.get(index).longValue());
-                }
-                query.append(")");
-                statement.executeUpdate(query.toString());
-            }
-        }
-        catch (Exception e) {
-            handleWriteFailure(e);
         }
     }
 
@@ -689,7 +702,7 @@ public class Database extends Queue {
             }
         }
         catch (Exception e) {
-            ErrorReporter.report(e);
+            reportDatabaseFailure(e);
         }
 
         return preparedStatement;
@@ -711,7 +724,7 @@ public class Database extends Queue {
             }
         }
         catch (Exception e) {
-            ErrorReporter.report(e);
+            reportDatabaseFailure(e);
         }
 
         return preparedStatement;
@@ -854,7 +867,7 @@ public class Database extends Queue {
 
         // Sign
         index = ", INDEX(wid,x,z,time), INDEX(user,time), INDEX(time), INDEX line_1_prefix_index(line_1(16)), INDEX line_2_prefix_index(line_2(16)), INDEX line_3_prefix_index(line_3(16)), INDEX line_4_prefix_index(line_4(16)), INDEX line_5_prefix_index(line_5(16)), INDEX line_6_prefix_index(line_6(16)), INDEX line_7_prefix_index(line_7(16)), INDEX line_8_prefix_index(line_8(16))";
-        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "sign(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),time int, user int, wid int, x int, y int, z int, action tinyint, color int, color_secondary int, data tinyint, waxed tinyint, face tinyint, line_1 varchar(100), line_2 varchar(100), line_3 varchar(100), line_4 varchar(100), line_5 varchar(100), line_6 varchar(100), line_7 varchar(100), line_8 varchar(100)" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "sign(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid),time int, user int, wid int, x int, y int, z int, action tinyint, color int, color_secondary int, data tinyint, waxed tinyint, face tinyint, line_1 TEXT, line_2 TEXT, line_3 TEXT, line_4 TEXT, line_5 TEXT, line_6 TEXT, line_7 TEXT, line_8 TEXT" + index + ") ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
 
         // Skull
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS " + prefix + "skull(rowid int NOT NULL AUTO_INCREMENT,PRIMARY KEY(rowid), time int, owner varchar(255), skin text) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4");
@@ -992,8 +1005,9 @@ public class Database extends Queue {
                 String attachDatabase = "";
 
                 if (purge && forceConnection == null) {
-                    String query = "ATTACH DATABASE '" + ConfigHandler.path + ConfigHandler.sqlite + ".tmp' AS tmp_db";
+                    String query = "ATTACH DATABASE ? AS tmp_db";
                     try (PreparedStatement preparedStatement = connection.prepareStatement(query)) {
+                        preparedStatement.setString(1, ConfigHandler.path + ConfigHandler.sqlite + ".tmp");
                         preparedStatement.execute();
                     }
                     attachDatabase = "tmp_db.";
@@ -1199,6 +1213,7 @@ public class Database extends Queue {
     private static synchronized void closeClickHouseChecked() throws SQLException {
         ClickHouseDatabase database = clickHouseDatabase;
         clickHouseDatabase = null;
+        UserStatement.clearClickHouseCaches();
         if (database != null) {
             database.close();
         }

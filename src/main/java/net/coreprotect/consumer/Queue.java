@@ -65,13 +65,17 @@ public class Queue {
         ConfigHandler.forceContainer.put(id, forceList);
     }
 
-    public static synchronized ItemStack[] pollForceContainer(String id) {
+    public static ItemStack[] pollForceContainer(String id) {
+        return pollForceContainer(id, 0);
+    }
+
+    public static synchronized ItemStack[] pollForceContainer(String id, int index) {
         List<ItemStack[]> forceList = ConfigHandler.forceContainer.get(id);
         if (forceList == null) {
             return null;
         }
 
-        ItemStack[] container = forceList.isEmpty() ? null : forceList.remove(0);
+        ItemStack[] container = index < 0 || index >= forceList.size() ? null : forceList.remove(index);
         if (forceList.isEmpty()) {
             ConfigHandler.forceContainer.remove(id);
         }
@@ -105,18 +109,18 @@ public class Queue {
         return chestId;
     }
 
-    private static void queueStandardData(Object[] data, String[] user, Object object, boolean first, long reservation) {
-        queueStandardData(data, user, object, first, null, null, reservation);
+    private static boolean queueStandardData(Object[] data, String[] user, Object object, boolean first, long reservation) {
+        return queueStandardData(data, user, object, first, null, null, reservation);
     }
 
-    private static synchronized <T> void queueStandardData(Object[] data, String[] user, Object object, boolean first, Map<Integer, ? extends Map<Integer, T>> additionalMaps, T additionalData, long reservation) {
+    private static synchronized <T> boolean queueStandardData(Object[] data, String[] user, Object object, boolean first, Map<Integer, ? extends Map<Integer, T>> additionalMaps, T additionalData, long reservation) {
         boolean rollbackPublication = Process.isRollbackPublication((int) data[1], object);
         if (Consumer.isPersistenceHalted()) {
             Consumer.completeReservation(reservation, 1);
             if (rollbackPublication) {
                 throw new IllegalStateException("Database persistence halted before rollback state could be queued");
             }
-            return;
+            return false;
         }
         int currentConsumer = (int) (reservation >>> 32);
         int consumerId = (int) reservation;
@@ -157,6 +161,7 @@ public class Queue {
                 Consumer.completeReservation(reservation, 1);
             }
         }
+        return published;
     }
 
     private static Location getBlockLocation(Location location) {
@@ -358,14 +363,39 @@ public class Queue {
         if (origin == null || currentLocation.getWorld() == null) {
             return;
         }
-        queueEntityInteraction(user, new EntityInteraction(entity.getUniqueId(), entity.getType(), origin, currentLocation, action, metadata));
+        boolean promotion = EntitySpawnTracking.beginDatabaseIdentityPromotion(entity);
+        EntityInteraction interaction = new EntityInteraction(entity.getUniqueId(), entity.getType(), origin, currentLocation, action, metadata).withIdentityPromotion(promotion);
+        queueEntityInteraction(user, interaction);
     }
 
     public static void queueEntityInteraction(String user, EntityInteraction interaction) {
         if (user == null || user.trim().isEmpty() || interaction == null) {
+            if (interaction != null && interaction.hasIdentityPromotion()) {
+                EntitySpawnTracking.cancelDatabaseIdentityPromotion(interaction.getEntityUuid(), interaction.getCurrentLocation());
+            }
             return;
         }
-        queueStandardData(new Object[] { null, Process.ENTITY_INTERACTION, null, 0, null, 0, 0, null }, new String[] { user, null }, interaction, false, Consumer.reserveConsumer());
+        queueReservedEntityInteraction(user, interaction, reserveEntityInteractionQueue());
+    }
+
+    protected static long reserveEntityInteractionQueue() {
+        return Consumer.reserveConsumer();
+    }
+
+    protected static void queueReservedEntityInteraction(String user, EntityInteraction interaction, long reservation) {
+        boolean queued = false;
+        try {
+            if (user == null || user.trim().isEmpty() || interaction == null) {
+                Consumer.completeReservation(reservation, 1);
+                return;
+            }
+            queued = queueStandardData(new Object[] { null, Process.ENTITY_INTERACTION, null, 0, null, 0, 0, null }, new String[] { user, null }, interaction, false, reservation);
+        }
+        finally {
+            if (!queued && interaction != null && interaction.hasIdentityPromotion()) {
+                EntitySpawnTracking.cancelDatabaseIdentityPromotion(interaction.getEntityUuid(), interaction.getCurrentLocation());
+            }
+        }
     }
 
     protected static void queueItemTransaction(String user, Location location, int time, int offset, int itemId) {
@@ -397,7 +427,36 @@ public class Queue {
     }
 
     public static void queueEntitySpawnRemoved(java.util.UUID uuid, Location location) {
-        queueEntitySpawnUpdate(EntitySpawnData.removed(uuid, location));
+        if (uuid == null || location == null || location.getWorld() == null) {
+            return;
+        }
+        int worldId = WorldUtils.getWorldId(location.getWorld().getName());
+        if (worldId < 0) {
+            queueEntitySpawnUpdate(EntitySpawnData.removed(uuid, location));
+            return;
+        }
+        queueEntitySpawnRemoved(uuid, new EntityInteractionOrigin(worldId, location.getX(), location.getY(), location.getZ()), location);
+    }
+
+    public static void queueEntitySpawnRemoved(Entity entity) {
+        if (entity == null) {
+            return;
+        }
+        Location location = entity.getLocation();
+        EntityInteractionOrigin origin = EntitySpawnTracking.getOrCreateInteractionOrigin(entity);
+        if (location.getWorld() == null) {
+            return;
+        }
+        if (origin == null) {
+            queueEntitySpawnUpdate(EntitySpawnData.removed(entity.getUniqueId(), location));
+            return;
+        }
+        queueEntitySpawnRemoved(entity.getUniqueId(), origin, location);
+    }
+
+    private static void queueEntitySpawnRemoved(java.util.UUID uuid, EntityInteractionOrigin origin, Location location) {
+        int time = (int) (System.currentTimeMillis() / 1000L);
+        queueEntitySpawnUpdate(EntitySpawnData.removed(uuid, origin, location, time));
     }
 
     public static void queueEntitySpawnRevived(java.util.UUID previousUuid, java.util.UUID uuid, Location location) {
@@ -437,8 +496,8 @@ public class Queue {
         queueStandardData(new Object[] { null, Process.PLAYER_COMMAND, null, 0, null, 0, 0, null }, new String[] { player.getName(), null }, new Object[] { timestamp, player.getLocation().clone() }, false, Consumer.consumerStrings, message, Consumer.reserveConsumer());
     }
 
-    protected static void queuePlayerInteraction(String user, BlockState block, Material type) {
-        queueStandardData(new Object[] { null, Process.PLAYER_INTERACTION, type, 0, null, 0, 0, null }, new String[] { user, null }, block, false, Consumer.reserveConsumer());
+    protected static void queuePlayerInteraction(String user, Location location, Material type, String blockData) {
+        queueStandardData(new Object[] { null, Process.PLAYER_INTERACTION, type, 0, null, 0, 0, blockData }, new String[] { user, null }, getBlockLocation(location), false, Consumer.reserveConsumer());
     }
 
     protected static void queuePlayerKill(String user, Location location, String player) {
@@ -609,5 +668,9 @@ public class Queue {
 
     protected static void queueWorldInsert(int id, String world) {
         queueStandardData(new Object[] { null, Process.WORLD_INSERT, null, 0, null, 0, id, null }, new String[] { null, null }, world, false, Consumer.reserveConsumer());
+    }
+
+    protected static boolean tryQueueIdentifierInsert(int action, int id, String value) {
+        return queueStandardData(new Object[] { null, action, null, 0, null, 0, id, null }, new String[] { null, null }, value, false, Consumer.reserveConsumer());
     }
 }

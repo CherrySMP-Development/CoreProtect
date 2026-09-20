@@ -6,6 +6,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -23,6 +24,7 @@ import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Consumer;
 import net.coreprotect.consumer.Queue;
+import net.coreprotect.database.statement.EntitySpawnStatement;
 import net.coreprotect.database.statement.UserStatement;
 import net.coreprotect.listener.channel.PluginChannelHandshakeListener;
 import net.coreprotect.model.action.EntityActionFilter;
@@ -30,6 +32,8 @@ import net.coreprotect.model.action.LookupActions;
 import net.coreprotect.model.action.SignActions;
 import net.coreprotect.model.item.InventorySources;
 import net.coreprotect.model.item.ItemTransactionActions;
+import net.coreprotect.model.lookup.EntityLookupContext;
+import net.coreprotect.model.lookup.LookupCursor;
 import net.coreprotect.model.lookup.LookupRollbackState;
 import net.coreprotect.utility.EntitySpawnTracking;
 import net.coreprotect.utility.EntityUtils;
@@ -61,6 +65,90 @@ public class LookupRaw extends Queue {
     }
 
     protected static List<Object[]> performLookupRaw(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState) {
+        EntityLookupContext entityContext = EntityLookupContext.legacy(loadedEntityUuids, loadedEntityCandidates);
+        return performLookupRaw(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, entityContainerId, rollbackState, null, true);
+    }
+
+    static RawLookupPage performDuckDBLookupPage(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitCount, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState) {
+        EntityLookupContext entityContext = EntityLookupContext.legacy(loadedEntityUuids, loadedEntityCandidates);
+        return performDuckDBLookupPage(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitCount, restrictWorld, lookup, entityContainerId, rollbackState);
+    }
+
+    static RawLookupPage performDuckDBLookupPage(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitCount, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState) {
+        return performDuckDBLookupPage(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, 0, limitCount, -1L, null, restrictWorld, lookup, entityContainerId, rollbackState);
+    }
+
+    static RawLookupPage performDuckDBLookupPage(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, long knownTotalRows, LookupCursor cursor, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState) {
+        if (!ConfigHandler.databaseType.isDuckDB()) {
+            throw new IllegalStateException("DuckDB lookup pages require DuckDB");
+        }
+
+        boolean paused = false;
+        try {
+            while (Consumer.isPaused && !Consumer.isPersistenceHalted()) {
+                Thread.sleep(1);
+            }
+            Consumer.isPaused = true;
+            paused = true;
+
+            Map<Integer, List<Long>> pageRows = new HashMap<>();
+            long totalRows = Math.max(knownTotalRows, 0L);
+            long cursorTime = 0L;
+            long cursorRowId = 0L;
+            int cursorSource = 0;
+            boolean orderByTime = false;
+            boolean foundPageRow = false;
+            try (ResultSet results = rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, 0, limitCount, restrictWorld, lookup, false, entityContainerId, false, false, false, rollbackState, null, true, limitOffset, knownTotalRows, cursor)) {
+                boolean first = true;
+                while (results.next()) {
+                    if (first) {
+                        totalRows = results.getLong("total_count");
+                        if (knownTotalRows < 0L && rowData != null) {
+                            for (int source = 0; source < rowData.length && source <= InventorySources.ENTITY_INTERACTION; source++) {
+                                rowData[source] = results.getLong("count_" + source);
+                            }
+                        }
+                        orderByTime = results.getBoolean("order_by_time");
+                        first = false;
+                    }
+                    Object sourceValue = results.getObject("tbl");
+                    Object rowIdValue = results.getObject("id");
+                    if (sourceValue instanceof Number && rowIdValue instanceof Number) {
+                        int source = ((Number) sourceValue).intValue();
+                        long rowId = ((Number) rowIdValue).longValue();
+                        pageRows.computeIfAbsent(source, ignored -> new ArrayList<>()).add(rowId);
+                        cursorSource = source;
+                        cursorRowId = rowId;
+                        cursorTime = results.getLong("sort_time");
+                        foundPageRow = true;
+                    }
+                }
+            }
+
+            if (totalRows == 0L || pageRows.isEmpty()) {
+                return new RawLookupPage(totalRows, Collections.emptyList(), null);
+            }
+            List<Object[]> rows = performLookupRaw(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, -1, -1, restrictWorld, lookup, entityContainerId, rollbackState, pageRows, false);
+            int currentPage = limitCount > 0 ? (limitOffset / limitCount) + 1 : 1;
+            LookupCursor nextCursor = foundPageRow ? new LookupCursor(currentPage + 1, limitCount, cursorTime, cursorSource, cursorRowId, orderByTime) : null;
+            return new RawLookupPage(totalRows, rows == null ? Collections.emptyList() : rows, nextCursor);
+        }
+        catch (Exception exception) {
+            ErrorReporter.report(exception);
+            return new RawLookupPage(knownTotalRows > 0L ? knownTotalRows : 0L, Collections.emptyList(), null);
+        }
+        finally {
+            if (paused && !Consumer.isPersistenceHalted()) {
+                Consumer.isPaused = false;
+            }
+        }
+    }
+
+    protected static List<Object[]> performLookupRaw(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState) {
+        return performLookupRaw(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, entityContainerId, rollbackState, null, true);
+    }
+
+    private static List<Object[]> performLookupRaw(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, Integer entityContainerId, LookupRollbackState rollbackState, Map<Integer, List<Long>> pageRows, boolean managePause) {
         List<Object[]> list = new ArrayList<>();
         List<Integer> invalidRollbackActions = new ArrayList<>();
         invalidRollbackActions.add(LookupActions.INTERACTION);
@@ -78,13 +166,34 @@ public class LookupRaw extends Queue {
 
         boolean paused = false;
         try {
-            while (Consumer.isPaused && !Consumer.isPersistenceHalted()) {
+            while (managePause && Consumer.isPaused && !Consumer.isPersistenceHalted()) {
                 Thread.sleep(1);
             }
-            Consumer.isPaused = true;
-            paused = true;
+            if (managePause) {
+                Consumer.isPaused = true;
+                paused = true;
+            }
 
-            ResultSet results = rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, loadedEntityUuids, loadedEntityCandidates, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, false, entityContainerId, rollbackState);
+            if (ConfigHandler.databaseType.isClickHouse() && pageRows == null && limitOffset >= 0 && limitCount > 0) {
+                pageRows = new HashMap<>();
+                try (ResultSet pageResults = rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, false, entityContainerId, false, false, false, rollbackState, null, true)) {
+                    if (pageResults == null) {
+                        return null;
+                    }
+                    while (pageResults.next()) {
+                        int source = pageResults.getInt("tbl");
+                        long rowId = pageResults.getLong("id");
+                        pageRows.computeIfAbsent(source, ignored -> new ArrayList<>()).add(rowId);
+                    }
+                }
+                if (pageRows.isEmpty()) {
+                    return list;
+                }
+                limitOffset = -1;
+                limitCount = -1;
+            }
+
+            ResultSet results = rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, false, entityContainerId, false, false, false, rollbackState, pageRows, false);
             if (results == null) {
                 return null;
             }
@@ -259,6 +368,31 @@ public class LookupRaw extends Queue {
         return list;
     }
 
+    static final class RawLookupPage {
+
+        private final long totalRows;
+        private final List<Object[]> rows;
+        private final LookupCursor nextCursor;
+
+        private RawLookupPage(long totalRows, List<Object[]> rows, LookupCursor nextCursor) {
+            this.totalRows = totalRows;
+            this.rows = rows;
+            this.nextCursor = nextCursor;
+        }
+
+        long getTotalRows() {
+            return totalRows;
+        }
+
+        List<Object[]> getRows() {
+            return rows;
+        }
+
+        LookupCursor getNextCursor() {
+            return nextCursor;
+        }
+    }
+
     static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count) {
         return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, Collections.emptyList(), location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count);
     }
@@ -280,7 +414,11 @@ public class LookupRaw extends Queue {
     }
 
     static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count, Integer entityContainerId, LookupRollbackState rollbackState) {
-        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, loadedEntityUuids, loadedEntityCandidates, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count, entityContainerId, false, false, false, rollbackState);
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, loadedEntityUuids, loadedEntityCandidates, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count, entityContainerId, false, false, false, rollbackState, null, false);
+    }
+
+    static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count, Integer entityContainerId, LookupRollbackState rollbackState) {
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count, entityContainerId, false, false, false, rollbackState, null, false);
     }
 
     static ResultSet rawSummaryResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, Integer entityContainerId, boolean countGroups) {
@@ -288,7 +426,11 @@ public class LookupRaw extends Queue {
     }
 
     static ResultSet rawSummaryResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, Integer entityContainerId, boolean countGroups, LookupRollbackState rollbackState) {
-        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, Collections.emptyList(), loadedEntityUuids, loadedEntityCandidates, location, radius, null, startTime, endTime, limitOffset, limitCount, restrictWorld, true, false, entityContainerId, true, countGroups, false, rollbackState);
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, Collections.emptyList(), loadedEntityUuids, loadedEntityCandidates, location, radius, null, startTime, endTime, limitOffset, limitCount, restrictWorld, true, false, entityContainerId, true, countGroups, false, rollbackState, null, false);
+    }
+
+    static ResultSet rawSummaryResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, EntityLookupContext entityContext, Location location, Integer[] radius, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, Integer entityContainerId, boolean countGroups, LookupRollbackState rollbackState) {
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, Collections.emptyList(), entityContext, location, radius, null, startTime, endTime, limitOffset, limitCount, restrictWorld, true, false, entityContainerId, true, countGroups, false, rollbackState, null, false);
     }
 
     static ResultSet rawSummaryPageResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, Integer entityContainerId) {
@@ -296,13 +438,28 @@ public class LookupRaw extends Queue {
     }
 
     static ResultSet rawSummaryPageResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, Integer entityContainerId, LookupRollbackState rollbackState) {
-        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, Collections.emptyList(), loadedEntityUuids, loadedEntityCandidates, location, radius, null, startTime, endTime, limitOffset, limitCount, restrictWorld, true, false, entityContainerId, true, false, true, rollbackState);
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, Collections.emptyList(), loadedEntityUuids, loadedEntityCandidates, location, radius, null, startTime, endTime, limitOffset, limitCount, restrictWorld, true, false, entityContainerId, true, false, true, rollbackState, null, false);
     }
 
-    private static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count, Integer entityContainerId, boolean summary, boolean countGroups, boolean includeGroupCount, LookupRollbackState rollbackState) {
+    static ResultSet rawSummaryPageResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, EntityLookupContext entityContext, Location location, Integer[] radius, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, Integer entityContainerId, LookupRollbackState rollbackState) {
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, Collections.emptyList(), entityContext, location, radius, null, startTime, endTime, limitOffset, limitCount, restrictWorld, true, false, entityContainerId, true, false, true, rollbackState, null, false);
+    }
+
+    private static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, Set<UUID> loadedEntityUuids, Set<UUID> loadedEntityCandidates, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count, Integer entityContainerId, boolean summary, boolean countGroups, boolean includeGroupCount, LookupRollbackState rollbackState, Map<Integer, List<Long>> pageRows, boolean selectPageRows) {
+        EntityLookupContext entityContext = EntityLookupContext.legacy(loadedEntityUuids, loadedEntityCandidates);
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count, entityContainerId, summary, countGroups, includeGroupCount, rollbackState, pageRows, selectPageRows);
+    }
+
+    private static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count, Integer entityContainerId, boolean summary, boolean countGroups, boolean includeGroupCount, LookupRollbackState rollbackState, Map<Integer, List<Long>> pageRows, boolean selectPageRows) {
+        return rawLookupResultSet(statement, user, checkUuids, checkUsers, restrictList, excludeList, excludeUserList, actionList, entityActionFilter, messageFilters, entityContext, location, radius, rowData, startTime, endTime, limitOffset, limitCount, restrictWorld, lookup, count, entityContainerId, summary, countGroups, includeGroupCount, rollbackState, pageRows, selectPageRows, 0, -1L, null);
+    }
+
+    private static ResultSet rawLookupResultSet(Statement statement, CommandSender user, List<String> checkUuids, List<String> checkUsers, List<Object> restrictList, Map<Object, Boolean> excludeList, List<String> excludeUserList, List<Integer> actionList, EntityActionFilter entityActionFilter, List<String> messageFilters, EntityLookupContext entityContext, Location location, Integer[] radius, Long[] rowData, long startTime, long endTime, int limitOffset, int limitCount, boolean restrictWorld, boolean lookup, boolean count, Integer entityContainerId, boolean summary, boolean countGroups, boolean includeGroupCount, LookupRollbackState rollbackState, Map<Integer, List<Long>> pageRows, boolean selectPageRows, int pageOffset, long knownTotalRows, LookupCursor cursor) {
         ResultSet results = null;
 
         try {
+            Set<UUID> loadedEntityUuids = entityContext.getLoadedEntityUuids();
+            Set<UUID> loadedEntityCandidates = entityContext.getLoadedEntityCandidates();
             List<Integer> validActions = Arrays.asList(LookupActions.BLOCK_BREAK, LookupActions.BLOCK_PLACE, LookupActions.INTERACTION, LookupActions.ENTITY_KILL, LookupActions.ENTITY_SPAWN);
             if (radius != null) {
                 restrictWorld = true;
@@ -314,6 +471,18 @@ public class LookupRaw extends Queue {
                     throw new IllegalArgumentException("Unable to resolve lookup world");
                 }
                 locationWorldId = WorldUtils.getWorldId(location.getWorld().getName());
+            }
+            Integer[] sourceBounds = radius;
+            if (sourceBounds == null && actionList.contains(5) && entityContainerId == null) {
+                sourceBounds = new Integer[] {
+                        0,
+                        (int) Math.floor(location.getX()),
+                        (int) Math.ceil(location.getX()),
+                        location.getBlockY(),
+                        location.getBlockY(),
+                        (int) Math.floor(location.getZ()),
+                        (int) Math.ceil(location.getZ())
+                };
             }
 
             boolean inventoryQuery = LookupActions.isInventoryLookup(actionList);
@@ -327,6 +496,21 @@ public class LookupRaw extends Queue {
             boolean entitySpawnRadius = entitySpawnLocation && radius != null;
             boolean entityContainerRadius = entityContainerLocation && radius != null;
             boolean currentEntityRadius = !lookup && (entitySpawnRadius || entityContainerRadius);
+            if (ConfigHandler.databaseType.isDuckDB()
+                    && pageRows == null
+                    && radius != null
+                    && location != null
+                    && location.getWorld() != null
+                    && (includeEntitySpawnLocations || includeEntityContainers || includeEntityInteractions)
+                    && !entityContext.isReusable()
+                    && loadedEntityUuids.isEmpty()
+                    && loadedEntityCandidates.isEmpty()) {
+                entityContext = includeEntityContainers || includeEntityInteractions
+                        ? EntitySpawnStatement.loadLookupContext(statement.getConnection(), location, radius)
+                        : EntitySpawnStatement.loadLookupContext(statement.getConnection(), location, radius, startTime, endTime);
+                loadedEntityUuids = entityContext.getLoadedEntityUuids();
+                loadedEntityCandidates = entityContext.getLoadedEntityCandidates();
+            }
             boolean validAction = false;
             String queryBlock = "";
             String queryEntity = "";
@@ -346,9 +530,11 @@ public class LookupRaw extends Queue {
             String index = "";
             String query = "";
             String entitySpawnLocationQuery = "";
+            String entitySpawnCurrentLocationQuery = "";
             String entityContainerLocationQuery = "";
             String entityInteractionLocationQuery = "";
             String standardLocationQuery = "";
+            String entityLocationCte = "";
             List<String> messageFilterBindings = new ArrayList<>();
 
             if (checkUuids.size() > 0) {
@@ -577,7 +763,8 @@ public class LookupRaw extends Queue {
                 Integer ymax = radius[4];
                 Integer zmin = radius[5];
                 Integer zmax = radius[6];
-                bounds = "x >= " + xmin + " AND x <= " + xmax + " AND z >= " + zmin + " AND z <= " + zmax;
+                bounds = LocationQuery.predicate("x", " >= " + xmin) + " AND " + LocationQuery.predicate("x", " <= " + xmax)
+                        + " AND " + LocationQuery.predicate("z", " >= " + zmin) + " AND " + LocationQuery.predicate("z", " <= " + zmax);
 
                 if (ymin != null && ymax != null) {
                     bounds += " AND y >= " + ymin + " AND y <= " + ymax;
@@ -586,7 +773,7 @@ public class LookupRaw extends Queue {
 
             if (entitySpawnLocation || entityContainerLocation || entityInteractionLocation) {
                 int wid = locationWorldId;
-                String originalLocation = "(wid=" + wid + (bounds.isEmpty() ? "" : " AND " + bounds) + ")";
+                String originalLocation = "(" + LocationQuery.predicate("wid", "=" + wid) + (bounds.isEmpty() ? "" : " AND " + bounds) + ")";
                 String entityBounds = "";
                 if (radius != null) {
                     long entityMinX = radius[1];
@@ -611,10 +798,22 @@ public class LookupRaw extends Queue {
                 if (!loadedEntityUuids.isEmpty()) {
                     databaseLocation += " OR uuid IN(" + uuidList(loadedEntityUuids) + ")";
                 }
+                boolean materializeEntityLocations = ConfigHandler.databaseType.isDuckDB() && pageRows == null;
+                if (materializeEntityLocations) {
+                    if (entityContext.isReusable()) {
+                        entityLocationCte = entityLocationCte(entityContext, databaseLocation);
+                    }
+                    else {
+                        entityLocationCte = "entity_location_rows AS MATERIALIZED (SELECT rowid,block_rowid,time FROM " + ConfigHandler.prefix + "entity_spawn WHERE (" + databaseLocation + "))";
+                    }
+                }
 
                 if (entitySpawnLocation) {
-                    String entitySpawnRows = "SELECT block_rowid FROM " + ConfigHandler.prefix + "entity_spawn WHERE (" + databaseLocation + ")" + entitySpawnTimeQuery(startTime, endTime);
-                    String spawnLocation = "rowid IN(" + entitySpawnRows + ")";
+                    String entitySpawnRows = materializeEntityLocations
+                            ? "SELECT block_rowid FROM entity_location_rows WHERE 1" + entitySpawnTimeQuery(startTime, endTime)
+                            : "SELECT block_rowid FROM " + ConfigHandler.prefix + "entity_spawn WHERE (" + databaseLocation + ")" + entitySpawnTimeQuery(startTime, endTime);
+                    entitySpawnCurrentLocationQuery = "rowid IN(" + entitySpawnRows + ")";
+                    String spawnLocation = entitySpawnCurrentLocationQuery;
                     if (lookup) {
                         spawnLocation = "(" + originalLocation + " OR " + spawnLocation + ")";
                     }
@@ -622,13 +821,13 @@ public class LookupRaw extends Queue {
                 }
 
                 if (entityContainerLocation) {
-                    String entitySpawnRows = "SELECT rowid FROM " + ConfigHandler.prefix + "entity_spawn WHERE (" + databaseLocation + ")";
+                    String entitySpawnRows = materializeEntityLocations ? "SELECT rowid FROM entity_location_rows" : "SELECT rowid FROM " + ConfigHandler.prefix + "entity_spawn WHERE (" + databaseLocation + ")";
                     String currentLocation = "entity_spawn_rowid IN(" + entitySpawnRows + ")";
                     entityContainerLocationQuery = lookup ? "(" + originalLocation + " OR " + currentLocation + ")" : currentLocation;
                 }
 
                 if (entityInteractionLocation) {
-                    String entitySpawnRows = "SELECT rowid FROM " + ConfigHandler.prefix + "entity_spawn WHERE (" + databaseLocation + ")";
+                    String entitySpawnRows = materializeEntityLocations ? "SELECT rowid FROM entity_location_rows" : "SELECT rowid FROM " + ConfigHandler.prefix + "entity_spawn WHERE (" + databaseLocation + ")";
                     String currentLocation = "entity_spawn_rowid IN(" + entitySpawnRows + ")";
                     entityInteractionLocationQuery = "(" + originalLocation + " OR " + currentLocation + ")";
                 }
@@ -638,7 +837,7 @@ public class LookupRaw extends Queue {
             }
             else {
                 if (restrictWorld) {
-                    queryBlock = queryBlock + " wid=" + locationWorldId + " AND";
+                    queryBlock = queryBlock + " " + LocationQuery.predicate("wid", "=" + locationWorldId) + " AND";
                 }
                 if (!bounds.isEmpty()) {
                     queryBlock = queryBlock + " " + bounds + " AND";
@@ -647,17 +846,19 @@ public class LookupRaw extends Queue {
 
             if (radius == null && actionList.contains(5) && entityContainerId == null) {
                 int worldId = locationWorldId;
-                int x = (int) Math.floor(location.getX());
-                int z = (int) Math.floor(location.getZ());
-                int x2 = (int) Math.ceil(location.getX());
-                int z2 = (int) Math.ceil(location.getZ());
+                int x = sourceBounds[1];
+                int z = sourceBounds[5];
+                int x2 = sourceBounds[2];
+                int z2 = sourceBounds[6];
 
-                queryBlock = queryBlock + " wid=" + worldId + " AND (x = " + x + " OR x = " + x2 + ") AND (z = " + z + " OR z = " + z2 + ") AND y = " + location.getBlockY() + " AND";
+                queryBlock = queryBlock + " " + LocationQuery.predicate("wid", "=" + worldId)
+                        + " AND (" + LocationQuery.predicate("x", " = " + x) + " OR " + LocationQuery.predicate("x", " = " + x2) + ")"
+                        + " AND (" + LocationQuery.predicate("z", " = " + z) + " OR " + LocationQuery.predicate("z", " = " + z2) + ") AND y = " + location.getBlockY() + " AND";
             }
 
             String actionPredicate = "";
             if (validAction) {
-                actionPredicate = buildActionPredicate(action, actionList, entityActionFilter);
+                actionPredicate = standardActionLookup ? buildActionPredicate(action, actionList, entityActionFilter) : "action IN(" + action + ")";
                 queryBlock = queryBlock + " " + actionPredicate + " AND";
             }
             else if (inventoryQuery || actionExclude.length() > 0 || includeBlock.length() > 0 || includeEntity.length() > 0 || excludeBlock.length() > 0 || excludeEntity.length() > 0) {
@@ -738,16 +939,15 @@ public class LookupRaw extends Queue {
             if (!actionPredicate.isEmpty()) {
                 queryEntityInteraction = queryEntityInteraction.replace(actionPredicate, "1");
             }
-
             String baseQuery = ((!includeEntity.isEmpty() || !excludeEntity.isEmpty()) ? queryEntity : queryBlock);
             String blockSourceQuery = actionList.size() == 1 && actionList.contains(LookupActions.INTERACTION) ? queryBlock : baseQuery;
-            if (!summary && limitOffset > -1 && limitCount > -1) {
+            if (!summary && !selectPageRows && limitOffset > -1 && limitCount > -1) {
                 queryLimit = " LIMIT " + limitCount + " OFFSET " + limitOffset;
                 unionLimit = " ORDER BY time DESC, id DESC LIMIT " + (limitOffset + limitCount) + "";
             }
 
             String rows = summary ? "rowid as id,time," + userColumn + ",wid,x,y,z,type,meta as metadata,data,-1 as amount,action,rolled_back,0 as entity_spawn_rowid" : "rowid as id,time," + userColumn + ",wid,x,y,z,action,type,data,meta,blockdata,rolled_back";
-            String queryOrder = " ORDER BY rowid DESC";
+            String queryOrder = " ORDER BY " + ConfigHandler.getDescendingEventOrder();
 
             if (actionList.contains(LookupActions.CONTAINER) || actionList.contains(5)) {
                 queryTable = "container";
@@ -781,6 +981,11 @@ public class LookupRaw extends Queue {
                 rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,data as metadata,0 as data,amount,action,rolled_back,0 as entity_spawn_rowid";
             }
 
+            if (selectPageRows) {
+                rows = "rowid as id,time";
+                queryLimit = "";
+                unionLimit = "";
+            }
             if (count) {
                 rows = "COUNT(*) as count";
                 queryLimit = " LIMIT 5 OFFSET 0";
@@ -824,13 +1029,32 @@ public class LookupRaw extends Queue {
                 }
             }
 
+            String originalBlockLocationQuery = "";
+            String currentBlockLocationQuery = "";
+            if (entitySpawnRadius && queryTable.equals("block") && !summary
+                    && (ConfigHandler.databaseType.isSQLite() || ConfigHandler.databaseType.isMySQL())
+                    && (users.isEmpty() || ((long) radius[2] - radius[1] <= 50 && (long) radius[6] - radius[5] <= 50))
+                    && (count || limitCount < 0 || users.isEmpty())) {
+                originalBlockLocationQuery = "(" + standardLocationQuery + " AND action" + (lookup ? " IS NOT NULL" : "!=" + LookupActions.ENTITY_SPAWN) + ")";
+                currentBlockLocationQuery = "(action=" + LookupActions.ENTITY_SPAWN + " AND " + entitySpawnCurrentLocationQuery
+                        + (lookup ? " AND " + standardLocationQuery + " IS NOT TRUE" : "") + ")";
+                if (ConfigHandler.databaseType.isMySQL()) {
+                    index = "";
+                }
+                queryOrder = count ? "" : " ORDER BY id DESC";
+            }
+
             boolean chatLookup = actionList.contains(LookupActions.CHAT);
             boolean commandLookup = actionList.contains(LookupActions.COMMAND);
             if (chatLookup && commandLookup) {
                 String chatQuery = appendMessageFilters(baseQuery, messageFilters, "chat", messageFilterBindings);
                 String commandQuery = appendMessageFilters(baseQuery, messageFilters, "command", messageFilterBindings);
-                query = unionSelect + "SELECT '0' as tbl," + rows + " FROM " + ConfigHandler.prefix + "chat WHERE" + chatQuery + unionLimit + ") UNION ALL ";
-                query += unionSelect + "SELECT '1' as tbl," + rows + " FROM " + ConfigHandler.prefix + "command WHERE" + commandQuery + unionLimit + ")";
+                chatQuery = restrictSource(chatQuery, pageRows, 0);
+                commandQuery = restrictSource(commandQuery, pageRows, 1);
+                String chatTable = sourceTable(statement, "chat", locationWorldId, sourceBounds, entityContext, false, pageRows);
+                String commandTable = sourceTable(statement, "command", locationWorldId, sourceBounds, entityContext, false, pageRows);
+                query = unionSelect + "SELECT 0 as tbl," + rows + " FROM " + chatTable + " WHERE" + chatQuery + unionLimit + ") UNION ALL ";
+                query += unionSelect + "SELECT 1 as tbl," + rows + " FROM " + commandTable + " WHERE" + commandQuery + unionLimit + ")";
                 if (!count) {
                     queryOrder = " ORDER BY time DESC, tbl DESC, id DESC";
                 }
@@ -839,12 +1063,12 @@ public class LookupRaw extends Queue {
                 baseQuery = appendMessageFilters(baseQuery, messageFilters, queryTable, messageFilterBindings);
             }
             else if (actionList.contains(LookupActions.SIGN)) {
-                baseQuery = appendSignMessageFilters(baseQuery, messageFilters, messageFilterBindings);
+                baseQuery = appendMessageFilters(baseQuery, messageFilters, "sign", messageFilterBindings);
             }
 
             boolean itemLookup = inventoryQuery;
             if ((lookup && actionList.size() == 0) || (itemLookup && !actionList.contains(LookupActions.BLOCK_BREAK))) {
-                if (!count) {
+                if (!count && !selectPageRows) {
                     rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,meta as metadata,data,-1 as amount,action,rolled_back,0 as entity_spawn_rowid";
                 }
 
@@ -856,7 +1080,7 @@ public class LookupRaw extends Queue {
                         baseQuery = baseQuery.replace("action NOT IN(-1)", "action IN(" + LookupActions.BLOCK_PLACE + ")");
                     }
 
-                    if (!count) {
+                    if (!count && !selectPageRows) {
                         rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,meta as metadata,data,1 as amount,action,rolled_back,0 as entity_spawn_rowid";
                     }
                 }
@@ -865,23 +1089,31 @@ public class LookupRaw extends Queue {
                     baseQuery = baseQuery.replace("action NOT IN(-1)", "action NOT IN(" + LookupActions.ENTITY_KILL + "," + LookupActions.ENTITY_SPAWN + ")"); // if block specified for include/exclude, filter out entity data
                 }
 
-                query = unionSelect + "SELECT " + "'0' as tbl," + rows + " FROM " + ConfigHandler.prefix + "block " + index + "WHERE" + baseQuery + unionLimit + ") UNION ALL ";
+                String sourceQuery = restrictSource(baseQuery, pageRows, InventorySources.BLOCK);
+                String sourceTable = sourceTable(statement, "block", locationWorldId, sourceBounds, entityContext, entitySpawnLocation, pageRows);
+                query = unionSelect + blockQuery(rows, sourceTable, index, sourceQuery, entitySpawnLocationQuery, originalBlockLocationQuery, currentBlockLocationQuery, count) + unionLimit + ") UNION ALL ";
                 itemLookup = true;
             }
 
             if (itemLookup) {
-                if (!count) {
+                if (!count && !selectPageRows) {
                     rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,metadata,data,amount,action,rolled_back,0 as entity_spawn_rowid";
                 }
-                query = query + unionSelect + "SELECT " + "'1' as tbl," + rows + " FROM " + ConfigHandler.prefix + "container WHERE" + queryNonBlock + unionLimit + ") UNION ALL ";
+                String containerSourceQuery = restrictSource(queryNonBlock, pageRows, InventorySources.CONTAINER);
+                String containerTable = sourceTable(statement, "container", locationWorldId, sourceBounds, entityContext, false, pageRows);
+                query = query + unionSelect + "SELECT 1 as tbl," + rows + " FROM " + containerTable + " WHERE" + containerSourceQuery + unionLimit + ") UNION ALL ";
 
-                if (!count) {
+                if (!count && !selectPageRows) {
                     rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,metadata,data,amount,action,rolled_back,entity_spawn_rowid";
                 }
-                query = query + unionSelect + "SELECT '" + InventorySources.ENTITY_CONTAINER + "' as tbl," + rows + " FROM " + ConfigHandler.prefix + "entity_container WHERE" + queryEntityContainer + unionLimit + ") UNION ALL ";
+                String entityContainerSourceQuery = restrictSource(queryEntityContainer, pageRows, InventorySources.ENTITY_CONTAINER);
+                String entityContainerTable = sourceTable(statement, "entity_container", locationWorldId, sourceBounds, entityContext, entityContainerLocation, pageRows, entityContainerId);
+                query = query + unionSelect + "SELECT " + InventorySources.ENTITY_CONTAINER + " as tbl," + rows + " FROM " + entityContainerTable + " WHERE" + entityContainerSourceQuery + unionLimit + ") UNION ALL ";
 
-                if (!count) {
+                if (!count && !selectPageRows) {
                     rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,data as metadata,0 as data,amount,action,rolled_back,0 as entity_spawn_rowid";
+                }
+                if (!count) {
                     queryOrder = " ORDER BY time DESC, tbl DESC, id DESC";
                 }
 
@@ -889,24 +1121,30 @@ public class LookupRaw extends Queue {
                     queryNonBlock = queryNonBlock.replace("action NOT IN(-1)", "action NOT IN(" + actionExclude + ")");
                 }
 
-                query = query + unionSelect + "SELECT " + "'2' as tbl," + rows + " FROM " + ConfigHandler.prefix + "item WHERE" + queryNonBlock + unionLimit + ")";
+                String itemSourceQuery = restrictSource(queryNonBlock, pageRows, InventorySources.ITEM);
+                String itemTable = sourceTable(statement, "item", locationWorldId, sourceBounds, entityContext, false, pageRows);
+                query = query + unionSelect + "SELECT 2 as tbl," + rows + " FROM " + itemTable + " WHERE" + itemSourceQuery + unionLimit + ")";
             }
 
             if (!itemLookup && (actionList.contains(LookupActions.CONTAINER) || actionList.contains(5))) {
-                if (!count) {
+                if (!count && !selectPageRows) {
                     rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,metadata,data,amount,action,rolled_back,0 as entity_spawn_rowid";
                 }
                 if (entityContainerId == null) {
-                    query = unionSelect + "SELECT '0' as tbl," + rows + " FROM " + ConfigHandler.prefix + "container WHERE" + queryNonBlock + unionLimit + ")";
+                    String sourceQuery = restrictSource(queryNonBlock, pageRows, 0);
+                    String sourceTable = sourceTable(statement, "container", locationWorldId, sourceBounds, entityContext, false, pageRows);
+                    query = unionSelect + "SELECT 0 as tbl," + rows + " FROM " + sourceTable + " WHERE" + sourceQuery + unionLimit + ")";
                 }
                 if (includeEntityContainers) {
                     if (!query.isEmpty()) {
                         query += " UNION ALL ";
                     }
-                    if (!count) {
+                    if (!count && !selectPageRows) {
                         rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,metadata,data,amount,action,rolled_back,entity_spawn_rowid";
                     }
-                    query += unionSelect + "SELECT '" + InventorySources.ENTITY_CONTAINER + "' as tbl," + rows + " FROM " + ConfigHandler.prefix + "entity_container WHERE" + queryEntityContainer + unionLimit + ")";
+                    String sourceQuery = restrictSource(queryEntityContainer, pageRows, InventorySources.ENTITY_CONTAINER);
+                    String sourceTable = sourceTable(statement, "entity_container", locationWorldId, sourceBounds, entityContext, entityContainerLocation, pageRows, entityContainerId);
+                    query += unionSelect + "SELECT " + InventorySources.ENTITY_CONTAINER + " as tbl," + rows + " FROM " + sourceTable + " WHERE" + sourceQuery + unionLimit + ")";
                 }
                 if (!count) {
                     queryOrder = " ORDER BY time DESC, tbl DESC, id DESC";
@@ -915,16 +1153,20 @@ public class LookupRaw extends Queue {
 
             if (includeEntityInteractions) {
                 if (query.isEmpty()) {
-                    if (!count) {
+                    if (!count && !selectPageRows) {
                         rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,meta as metadata,data,-1 as amount,action,rolled_back,0 as entity_spawn_rowid";
                     }
-                    query = unionSelect + "SELECT '0' as tbl," + rows + " FROM " + ConfigHandler.prefix + "block " + index + "WHERE" + blockSourceQuery + unionLimit + ")";
+                    String sourceQuery = restrictSource(blockSourceQuery, pageRows, InventorySources.BLOCK);
+                    String sourceTable = sourceTable(statement, "block", locationWorldId, sourceBounds, entityContext, entitySpawnLocation, pageRows);
+                    query = unionSelect + blockQuery(rows, sourceTable, index, sourceQuery, entitySpawnLocationQuery, originalBlockLocationQuery, currentBlockLocationQuery, count) + unionLimit + ")";
                 }
 
-                if (!count) {
+                if (!count && !selectPageRows) {
                     rows = "rowid as id,time," + userColumn + ",wid,x,y,z,type,metadata,action as data,-1 as amount," + LookupActions.INTERACTION + " as action,rolled_back,entity_spawn_rowid";
                 }
-                query += " UNION ALL " + unionSelect + "SELECT '" + InventorySources.ENTITY_INTERACTION + "' as tbl," + rows + " FROM " + ConfigHandler.prefix + "entity_interaction WHERE" + queryEntityInteraction + unionLimit + ")";
+                String sourceQuery = restrictSource(queryEntityInteraction, pageRows, InventorySources.ENTITY_INTERACTION);
+                String sourceTable = sourceTable(statement, "entity_interaction", locationWorldId, sourceBounds, entityContext, entityInteractionLocation, pageRows);
+                query += " UNION ALL " + unionSelect + "SELECT " + InventorySources.ENTITY_INTERACTION + " as tbl," + rows + " FROM " + sourceTable + " WHERE" + sourceQuery + unionLimit + ")";
                 if (!count) {
                     queryOrder = " ORDER BY time DESC, tbl DESC, id DESC";
                 }
@@ -935,14 +1177,41 @@ public class LookupRaw extends Queue {
                     baseQuery = baseQuery.replace("action NOT IN(-1)", "action NOT IN(" + actionExclude + ")");
                 }
 
-                query = "SELECT " + "'0' as tbl," + rows + " FROM " + ConfigHandler.prefix + queryTable + " " + index + "WHERE" + baseQuery;
+                boolean entityFallback = queryTable.equals("block") ? entitySpawnLocation
+                        : queryTable.equals("entity_container") ? entityContainerLocation
+                                : queryTable.equals("entity_interaction") && entityInteractionLocation;
+                baseQuery = restrictSource(baseQuery, pageRows, 0);
+                Integer exactEntitySpawnRowId = queryTable.equals("entity_container") ? entityContainerId : null;
+                String sourceTable = sourceTable(statement, queryTable, locationWorldId, sourceBounds, entityContext, entityFallback, pageRows, exactEntitySpawnRowId);
+                query = queryTable.equals("block")
+                        ? blockQuery(rows, sourceTable, index, baseQuery, entitySpawnLocationQuery, originalBlockLocationQuery, currentBlockLocationQuery, count)
+                        : "SELECT 0 as tbl," + rows + " FROM " + sourceTable + " " + index + "WHERE" + baseQuery;
             }
 
-            if (summary) {
+            if (selectPageRows) {
+                if (ConfigHandler.databaseType.isClickHouse()) {
+                    query = buildClickHousePageQuery(query, queryOrder, limitOffset, limitCount);
+                }
+                else {
+                    query = buildDuckDBPageQuery(query, entityLocationCte, pageOffset, limitCount, knownTotalRows, cursor, queryOrder.contains("time DESC"));
+                }
+            }
+            else if (summary) {
                 query = buildSummaryQuery(query, inventoryQuery, countGroups, includeGroupCount, limitOffset, limitCount);
             }
             else {
-                query = query + queryOrder + queryLimit + "";
+                if (ConfigHandler.databaseType.isClickHouse() && query.contains(" UNION ALL ")) {
+                    query = "SELECT * FROM (" + query + ") AS coreprotectLookupUnion" + queryOrder + queryLimit;
+                }
+                else {
+                    query = query + queryOrder + queryLimit;
+                }
+            }
+            if (!selectPageRows && !entityLocationCte.isEmpty()) {
+                query = "WITH " + entityLocationCte + " " + query;
+            }
+            if (pageRows != null) {
+                messageFilterBindings.clear();
             }
             results = executeQuery(statement, query, messageFilterBindings);
         }
@@ -951,6 +1220,199 @@ public class LookupRaw extends Queue {
         }
 
         return results;
+    }
+
+    private static String blockQuery(String rows, String table, String index, String predicate, String entityLocation, String originalLocation, String currentLocation, boolean count) {
+        String select = "SELECT 0 as tbl," + rows + " FROM " + table + " ";
+        if (originalLocation.isEmpty()) {
+            return select + index + "WHERE" + predicate;
+        }
+
+        String originalQuery = select + index + "WHERE" + predicate.replace(entityLocation, originalLocation);
+        String currentIndex = ConfigHandler.databaseType.isMySQL() ? "USE INDEX(PRIMARY) " : "NOT INDEXED ";
+        String currentQuery = select + currentIndex + "WHERE" + predicate.replace(entityLocation, currentLocation);
+        return (count ? "SELECT 0 as tbl,SUM(count) as count" : "SELECT *")
+                + " FROM (" + originalQuery + " UNION ALL " + currentQuery + ") AS coreprotect_block";
+    }
+
+    private static String restrictSource(String query, Map<Integer, List<Long>> pageRows, int source) {
+        if (pageRows != null) {
+            List<Long> rowIds = pageRows.get(source);
+            if (rowIds == null || rowIds.isEmpty()) {
+                return " 1=0";
+            }
+            StringJoiner values = new StringJoiner(",");
+            for (Long rowId : rowIds) {
+                values.add(Long.toString(rowId));
+            }
+            return " rowid IN(" + values + ")";
+        }
+        return query;
+    }
+
+    private static String sourceTable(Statement statement, String table, int worldId, Integer[] sourceBounds, EntityLookupContext entityContext, boolean entityFallback, Map<Integer, List<Long>> pageRows) throws Exception {
+        return sourceTable(statement, table, worldId, sourceBounds, entityContext, entityFallback, pageRows, null);
+    }
+
+    private static String sourceTable(Statement statement, String table, int worldId, Integer[] sourceBounds, EntityLookupContext entityContext, boolean entityFallback, Map<Integer, List<Long>> pageRows, Integer exactEntitySpawnRowId) throws Exception {
+        String tableName = ConfigHandler.prefix + table;
+        if (!ConfigHandler.databaseType.isDuckDB() || pageRows != null) {
+            return tableName;
+        }
+        if (exactEntitySpawnRowId != null) {
+            return DuckDBSpatialIndex.entityTableExpression(statement.getConnection(), ConfigHandler.prefix, table, Collections.singleton(exactEntitySpawnRowId), "duckdb_spatial_rows");
+        }
+        if (sourceBounds == null) {
+            return tableName;
+        }
+        if (entityFallback && !entityContext.isReusable()) {
+            return tableName;
+        }
+
+        Set<Integer> entitySpawnRowIds = entityFallback ? entityContext.getEntitySpawnRowIds() : Collections.emptySet();
+        Set<Long> blockRowIds = entityFallback && table.equals("block") ? entityContext.getBlockRowIds() : Collections.emptySet();
+        return DuckDBSpatialIndex.tableExpression(
+                statement.getConnection(),
+                ConfigHandler.prefix,
+                table,
+                worldId,
+                sourceBounds[1],
+                sourceBounds[2],
+                sourceBounds[5],
+                sourceBounds[6],
+                entitySpawnRowIds,
+                blockRowIds
+        );
+    }
+
+    private static String entityLocationCte(EntityLookupContext context, String databaseLocation) {
+        if (context.getRows().isEmpty()) {
+            return "entity_location_rows AS MATERIALIZED (SELECT CAST(NULL AS BIGINT) AS rowid,CAST(NULL AS BIGINT) AS block_rowid,CAST(NULL AS BIGINT) AS time WHERE false)";
+        }
+
+        StringJoiner values = new StringJoiner(",");
+        for (EntityLookupContext.Row row : context.getRows()) {
+            String blockRowId = row.getBlockRowId() == null ? "CAST(NULL AS BIGINT)" : Long.toString(row.getBlockRowId());
+            String time = row.getTime() == null ? "CAST(NULL AS BIGINT)" : Long.toString(row.getTime());
+            String currentWorldId = row.getCurrentWorldId() == null ? "CAST(NULL AS INTEGER)" : Integer.toString(row.getCurrentWorldId());
+            String x = nullableDoubleLiteral(row.getX());
+            String y = nullableDoubleLiteral(row.getY());
+            String z = nullableDoubleLiteral(row.getZ());
+            values.add("(" + row.getRowId()
+                    + "," + blockRowId
+                    + "," + time
+                    + ",'" + row.getUuid() + "'"
+                    + "," + currentWorldId
+                    + "," + x
+                    + "," + y
+                    + "," + z
+                    + ")");
+        }
+        return "entity_location_rows AS MATERIALIZED (SELECT rowid,block_rowid,time FROM (VALUES " + values
+                + ") AS entity_context(rowid,block_rowid,time,uuid,current_wid,x,y,z) WHERE (" + databaseLocation + "))";
+    }
+
+    private static String nullableDoubleLiteral(Double value) {
+        return value == null ? "CAST(NULL AS DOUBLE)" : doubleLiteral(value);
+    }
+
+    private static String doubleLiteral(double value) {
+        if (Double.isNaN(value)) {
+            return "CAST('NaN' AS DOUBLE)";
+        }
+        if (value == Double.POSITIVE_INFINITY) {
+            return "CAST('Infinity' AS DOUBLE)";
+        }
+        if (value == Double.NEGATIVE_INFINITY) {
+            return "CAST('-Infinity' AS DOUBLE)";
+        }
+        return Double.toString(value);
+    }
+
+    private static String buildDuckDBPageQuery(String sourceQuery, String entityLocationCte, int offset, int limit, long knownTotalRows, LookupCursor cursor, boolean orderByTime) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("DuckDB lookup page size must be positive");
+        }
+        if (offset < 0) {
+            throw new IllegalArgumentException("DuckDB lookup page offset must not be negative");
+        }
+        if (cursor != null && (knownTotalRows < 0L || cursor.isOrderByTime() != orderByTime)) {
+            cursor = null;
+        }
+
+        StringBuilder query = new StringBuilder("WITH ");
+        if (!entityLocationCte.isEmpty()) {
+            query.append(entityLocationCte).append(',');
+        }
+        query.append("candidate_rows AS (SELECT CAST(tbl AS INTEGER) AS tbl,id,time FROM (")
+                .append(sourceQuery)
+                .append(") lookup_sources),");
+        if (cursor != null) {
+            query.append("page_candidates AS (SELECT * FROM candidate_rows WHERE ");
+            if (orderByTime) {
+                query.append("STRUCT_PACK(sort_time := COALESCE(time,-2147483648),tbl := tbl,id := id)<STRUCT_PACK(sort_time := ")
+                        .append(cursor.getTime())
+                        .append(",tbl := ")
+                        .append(cursor.getSource())
+                        .append(",id := ")
+                        .append(cursor.getRowId())
+                        .append(")");
+            }
+            else {
+                query.append("id<").append(cursor.getRowId());
+            }
+            query.append("),");
+        }
+        boolean countRows = knownTotalRows < 0L;
+        String aggregateSource = cursor == null ? "candidate_rows" : "page_candidates";
+        query.append("page_aggregate AS (SELECT ");
+        if (countRows) {
+            query.append("COUNT(*) AS total_count");
+            for (int source = 0; source <= InventorySources.ENTITY_INTERACTION; source++) {
+                query.append(",COUNT_IF(tbl=").append(source).append(") AS count_").append(source);
+            }
+            query.append(',');
+        }
+        query.append("MAX_BY(STRUCT_PACK(tbl := tbl,id := id,sort_time := COALESCE(time,-2147483648)),");
+        if (orderByTime) {
+            query.append("STRUCT_PACK(sort_time := COALESCE(time,-2147483648),tbl := tbl,id := id)");
+        }
+        else {
+            query.append("STRUCT_PACK(id := id)");
+        }
+        long requestedRows = cursor == null ? (long) offset + limit : limit;
+        if (requestedRows > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("DuckDB lookup page is too deep");
+        }
+        query.append(',').append(requestedRows).append(") AS newest FROM ").append(aggregateSource).append(") ")
+                .append("SELECT ").append(countRows ? "total_count" : Long.toString(knownTotalRows)).append(" AS total_count");
+        for (int source = 0; source <= InventorySources.ENTITY_INTERACTION; source++) {
+            query.append(',').append(countRows ? "count_" + source : "0").append(" AS count_").append(source);
+        }
+        query.append(',').append(orderByTime).append(" AS order_by_time,candidate.tbl,candidate.id,candidate.sort_time FROM page_aggregate ")
+                .append("LEFT JOIN LATERAL UNNEST(newest) AS page_row(candidate) ON true ");
+        if (orderByTime) {
+            query.append("ORDER BY candidate.sort_time DESC NULLS LAST,candidate.tbl DESC NULLS LAST,candidate.id DESC NULLS LAST");
+        }
+        else {
+            query.append("ORDER BY candidate.id DESC NULLS LAST");
+        }
+        if (cursor == null && offset > 0) {
+            query.append(" LIMIT ").append(limit).append(" OFFSET ").append(offset);
+        }
+        return query.toString();
+    }
+
+    private static String buildClickHousePageQuery(String sourceQuery, String queryOrder, int offset, int limit) {
+        if (limit <= 0) {
+            throw new IllegalArgumentException("ClickHouse lookup page size must be positive");
+        }
+        if (offset < 0) {
+            throw new IllegalArgumentException("ClickHouse lookup page offset must not be negative");
+        }
+        String candidateOrder = queryOrder.replace("rowid", "id");
+        return "SELECT tbl,id FROM (" + sourceQuery + ") AS coreprotectLookupCandidates"
+                + candidateOrder + " LIMIT " + limit + " OFFSET " + offset;
     }
 
     private static String buildRollbackPredicate(LookupRollbackState rollbackState, boolean inventoryRollback) {
@@ -1033,6 +1495,40 @@ public class LookupRaw extends Queue {
             return baseQuery;
         }
 
+        List<String> included = new ArrayList<>();
+        List<String> excluded = new ArrayList<>();
+        for (String filter : messageFilters) {
+            if (filter != null && filter.startsWith("-")) {
+                excluded.add(filter.substring(1));
+            }
+            else {
+                included.add(filter);
+            }
+        }
+
+        boolean sign = table.equals("sign");
+        String query = sign ? appendSignMessagePrefixes(baseQuery, included, bindings) : appendMessagePrefixes(baseQuery, included, table, bindings);
+        return appendMessageExclusions(query, excluded, sign, bindings);
+    }
+
+    private static String appendMessagePrefixes(String baseQuery, List<String> messageFilters, String table, List<String> bindings) {
+        if (messageFilters.isEmpty()) {
+            return baseQuery;
+        }
+
+        if (ConfigHandler.databaseType.isDuckDB()) {
+            StringBuilder query = new StringBuilder(baseQuery).append(" AND (");
+            for (int index = 0; index < messageFilters.size(); index++) {
+                if (index > 0) {
+                    query.append(" OR ");
+                }
+                query.append("message ILIKE ? ESCAPE '~'");
+                String filter = messageFilters.get(index) == null ? "" : messageFilters.get(index);
+                bindings.add(escapeLike(filter) + "%");
+            }
+            return query.append(')').toString();
+        }
+
         String alias = table + "FilterRows";
         String likeOperator = ConfigHandler.databaseType.isColumnar() ? " ILIKE " : " LIKE ";
         String escapeClause = ConfigHandler.databaseType.isClickHouse() ? "" : " ESCAPE '~'";
@@ -1055,9 +1551,30 @@ public class LookupRaw extends Queue {
         return query.append("))").toString();
     }
 
-    private static String appendSignMessageFilters(String baseQuery, List<String> messageFilters, List<String> bindings) {
-        if (messageFilters == null || messageFilters.isEmpty()) {
+    private static String appendSignMessagePrefixes(String baseQuery, List<String> messageFilters, List<String> bindings) {
+        if (messageFilters.isEmpty()) {
             return baseQuery;
+        }
+
+        if (ConfigHandler.databaseType.isDuckDB()) {
+            StringBuilder query = new StringBuilder(baseQuery).append(" AND (");
+            for (int filterIndex = 0; filterIndex < messageFilters.size(); filterIndex++) {
+                if (filterIndex > 0) {
+                    query.append(" OR ");
+                }
+                query.append("((face=0 AND (");
+                appendDuckDBSignLines(query, 1, 4);
+                query.append(")) OR (face<>0 AND (");
+                appendDuckDBSignLines(query, 5, 8);
+                query.append(")))");
+
+                String filter = messageFilters.get(filterIndex) == null ? "" : messageFilters.get(filterIndex);
+                String message = escapeLike(filter) + "%";
+                for (int line = 1; line <= 8; line++) {
+                    bindings.add(message);
+                }
+            }
+            return query.append(')').toString();
         }
 
         String alias = "signFilterRows";
@@ -1086,6 +1603,52 @@ public class LookupRaw extends Queue {
             }
         }
         return query.append(")").toString();
+    }
+
+    private static String appendMessageExclusions(String baseQuery, List<String> excluded, boolean sign, List<String> bindings) {
+        if (excluded.isEmpty()) {
+            return baseQuery;
+        }
+
+        String match = (ConfigHandler.databaseType.isColumnar() ? " NOT ILIKE ?" : " NOT LIKE ?")
+                + (ConfigHandler.databaseType.isClickHouse() ? "" : " ESCAPE '~'");
+        StringBuilder query = new StringBuilder(baseQuery);
+        for (String filter : excluded) {
+            String pattern = escapeLike(filter) + "%";
+            if (sign) {
+                query.append(" AND (face IS NULL OR (face=0 AND (");
+                appendExcludedSignLines(query, 1, 4, match);
+                query.append(")) OR (face<>0 AND (");
+                appendExcludedSignLines(query, 5, 8, match);
+                query.append(")))");
+                for (int line = 1; line <= 8; line++) {
+                    bindings.add(pattern);
+                }
+            }
+            else {
+                query.append(" AND (message IS NULL OR message").append(match).append(')');
+                bindings.add(pattern);
+            }
+        }
+        return query.toString();
+    }
+
+    private static void appendExcludedSignLines(StringBuilder query, int firstLine, int lastLine, String match) {
+        for (int line = firstLine; line <= lastLine; line++) {
+            if (line > firstLine) {
+                query.append(" AND ");
+            }
+            query.append("(line_").append(line).append(" IS NULL OR line_").append(line).append(match).append(')');
+        }
+    }
+
+    private static void appendDuckDBSignLines(StringBuilder query, int firstLine, int lastLine) {
+        for (int line = firstLine; line <= lastLine; line++) {
+            if (line > firstLine) {
+                query.append(" OR ");
+            }
+            query.append("line_").append(line).append(" ILIKE ? ESCAPE '~'");
+        }
     }
 
     private static String firstCodePoints(String value, int maximum) {

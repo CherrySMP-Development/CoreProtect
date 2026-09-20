@@ -4,52 +4,53 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.StringJoiner;
 
 public final class ClickHouseSchema {
 
-    static final int VERSION = 1;
+    static final int VERSION = 4;
+    static final String BATCH_RECEIPT_FAMILY = "_batch_receipt";
 
     private static final String INTEGER_CODEC = " CODEC(Delta, ZSTD(3))";
     private static final String VALUE_CODEC = " CODEC(ZSTD(3))";
+    private static final String SPARSE_SERIALIZATION_SETTING = "ratio_of_defaults_for_sparse_serialization=0.9";
     private static final String PURGEABLE_FAMILIES = purgeableFamilies();
-    private static final String EVENT_PARTITION_KEY = "if(family IN (" + PURGEABLE_FAMILIES + "),toYYYYMM(toDateTime(time,'UTC')),0)";
-    private static final String EVENT_SORTING_KEY = "(dataset_id,family,wid,x,z,if(family IN ('database_lock','user','version'),0,time),rowid)";
+    private static final String EVENT_PARTITION_KEY = "if(family='" + BATCH_RECEIPT_FAMILY + "',wid,if(family IN (" + PURGEABLE_FAMILIES
+            + "),toYYYYMM(toDateTime(time,'UTC')),0))";
+    private static final String EVENT_SORTING_KEY = "(family,wid,x,z,if(family IN ('database_lock','user','version'),0,time),rowid,if(family='"
+            + BATCH_RECEIPT_FAMILY + "',toString(batch_id),''))";
     private static final String[][] EVENT_DATA_SKIPPING_INDEX_DEFINITIONS = {
-            { "producer_sequence_idx", "producer_sequence", "minmax", "1" },
+            { "batch_sequence_idx", "batch_sequence", "minmax", "1" },
             { "rowid_idx", "rowid", "bloom_filter(0.01)", "1" },
             { "entity_uuid_idx", "uuid", "bloom_filter(0.01)", "1" },
             { "entity_kill_rowid_idx", "kill_rowid", "bloom_filter(0.01)", "1" }
     };
     private static final String[][] STORAGE_METADATA_COLUMN_DEFINITIONS = {
             { "dataset_id", "UUID" + VALUE_CODEC },
-            { "producer_id", "UUID" + VALUE_CODEC },
             { "schema_version", "UInt32" + INTEGER_CODEC },
             { "created_at", "DateTime64(3, 'UTC')" + INTEGER_CODEC }
     };
-    private static final String[][] WRITER_REGISTRATION_COLUMN_DEFINITIONS = {
-            { "dataset_id", "UUID" },
-            { "producer_id", "UUID" },
-            { "writer_id", "UUID" },
-            { "registration_order", "UInt64 DEFAULT generateSnowflakeID()" },
-            { "registered_at", "DateTime64(3, 'UTC')" }
+    private static final String[][] IDENTITY_RESERVATION_COLUMN_DEFINITIONS = {
+            { "sequence", "String" + VALUE_CODEC },
+            { "block_start", "UInt64" + INTEGER_CODEC },
+            { "writer_id", "UUID" + VALUE_CODEC }
     };
     private static final String[][] RETENTION_HIGH_WATER_COLUMN_DEFINITIONS = {
-            { "dataset_id", "UUID" + VALUE_CODEC },
-            { "producer_id", "UUID" + VALUE_CODEC },
-            { "producer_sequence", "UInt64" + INTEGER_CODEC },
+            { "batch_sequence", "UInt64" + INTEGER_CODEC },
             { "family", "LowCardinality(String)" + VALUE_CODEC },
             { "rowid", "UInt64" + INTEGER_CODEC },
             { "recorded_at", "DateTime64(3, 'UTC')" + INTEGER_CODEC }
     };
     private static final String[][] EVENT_COLUMN_DEFINITIONS = {
-            { "dataset_id", "UUID" + VALUE_CODEC },
-            { "producer_id", "UUID" + VALUE_CODEC },
-            { "producer_sequence", "UInt64" + INTEGER_CODEC },
+            { "batch_sequence", "UInt64" + INTEGER_CODEC },
             { "batch_id", "UUID" + VALUE_CODEC },
             { "batch_ordinal", "UInt32" + INTEGER_CODEC },
             { "family", "LowCardinality(String)" + VALUE_CODEC },
@@ -60,6 +61,9 @@ public final class ClickHouseSchema {
             { "x", "Int32" + INTEGER_CODEC },
             { "y", "Nullable(Int32)" + VALUE_CODEC },
             { "z", "Int32" + INTEGER_CODEC },
+            { "wid_present", "Nullable(UInt8)" + VALUE_CODEC },
+            { "x_present", "Nullable(UInt8)" + VALUE_CODEC },
+            { "z_present", "Nullable(UInt8)" + VALUE_CODEC },
             { "type", "Nullable(UInt32)" + VALUE_CODEC },
             { "data", "Nullable(Int64)" + VALUE_CODEC },
             { "payload", "Nullable(String)" + VALUE_CODEC },
@@ -120,11 +124,19 @@ public final class ClickHouseSchema {
         throw new IllegalStateException("Schema class");
     }
 
+    static int eventPartitionId(ClickHouseFamily family, int time) {
+        if (!family.isPurgeable()) {
+            return 0;
+        }
+        LocalDateTime timestamp = LocalDateTime.ofEpochSecond(Integer.toUnsignedLong(time), 0, ZoneOffset.UTC);
+        return timestamp.getYear() * 100 + timestamp.getMonthValue();
+    }
+
     public static List<String> createStatements(String database, String prefix) {
         Names names = new Names(database, prefix);
         List<String> statements = new ArrayList<>();
         statements.add(createStorageMetadata(names));
-        statements.add(createWriterRegistration(names));
+        statements.add(createIdentityReservation(names));
         statements.add(createRetentionHighWater(names));
         statements.add(createEventData(names));
         addCompatibilityViews(statements, names);
@@ -135,18 +147,18 @@ public final class ClickHouseSchema {
         Names names = new Names(database, prefix);
         validateTable(connection, database, names.rawTable("storage_metadata"), "MergeTree", "tuple()", "", STORAGE_METADATA_COLUMN_DEFINITIONS,
                 "fsync_after_insert=1", "fsync_part_directory=1");
-        validateTable(connection, database, names.rawTable("writer_registration"), "MergeTree", "(registration_order,writer_id)", "", WRITER_REGISTRATION_COLUMN_DEFINITIONS,
-                "fsync_after_insert=1", "fsync_part_directory=1");
-        validateTable(connection, database, names.rawTable("retention_high_water"), "MergeTree", "(dataset_id,family,producer_sequence,rowid)", "", RETENTION_HIGH_WATER_COLUMN_DEFINITIONS,
+        validateTable(connection, database, names.rawTable("identity_reservation"), "MergeTree", "(sequence,block_start,writer_id)", "",
+                IDENTITY_RESERVATION_COLUMN_DEFINITIONS, "fsync_after_insert=1", "fsync_part_directory=1", "enable_block_number_column=1");
+        validateTable(connection, database, names.rawTable("retention_high_water"), "MergeTree", "(batch_sequence,family,rowid)", "", RETENTION_HIGH_WATER_COLUMN_DEFINITIONS,
                 "fsync_after_insert=1", "fsync_part_directory=1", "non_replicated_deduplication_window=1000");
         validateTable(connection, database, names.rawTable("event_data"), "CoalescingMergeTree", EVENT_SORTING_KEY, EVENT_PARTITION_KEY, EVENT_COLUMN_DEFINITIONS,
-                "fsync_after_insert=1", "fsync_part_directory=1", "non_replicated_deduplication_window=1000");
+                "fsync_after_insert=1", "fsync_part_directory=1", "non_replicated_deduplication_window=1000", SPARSE_SERIALIZATION_SETTING);
         validateDataSkippingIndexes(connection, database, names.rawTable("event_data"), EVENT_DATA_SKIPPING_INDEX_DEFINITIONS);
     }
 
     static void requireUnownedTablesEmpty(Connection connection, String database, String prefix) throws SQLException {
         Names names = new Names(database, prefix);
-        for (String suffix : new String[] { "writer_registration", "retention_high_water", "event_data" }) {
+        for (String suffix : new String[] { "identity_reservation", "retention_high_water", "event_data" }) {
             try (PreparedStatement statement = connection.prepareStatement("SELECT 1 FROM " + names.table(suffix) + " LIMIT 1"); ResultSet resultSet = statement.executeQuery()) {
                 if (resultSet.next()) {
                     throw new SQLException("ClickHouse table " + names.rawTable(suffix) + " contains data without CoreProtect storage metadata");
@@ -185,32 +197,44 @@ public final class ClickHouseSchema {
             }
         }
 
-        String columnQuery = "SELECT name,type,default_kind,default_expression FROM system.columns WHERE database=? AND table=? ORDER BY position";
+        String columnQuery = "SELECT name,type,default_kind,default_expression FROM system.columns WHERE database=? AND table=?";
         try (PreparedStatement statement = connection.prepareStatement(columnQuery)) {
             statement.setString(1, database);
             statement.setString(2, table);
             try (ResultSet resultSet = statement.executeQuery()) {
-                for (String[] expectedColumn : expectedColumns) {
-                    if (!resultSet.next()) {
-                        throw new SQLException("ClickHouse table has missing columns: " + table);
-                    }
-                    String definition = expectedColumn[1];
-                    String expectedDefault = defaultExpression(definition);
-                    String defaultKind = resultSet.getString(3);
-                    String defaultExpression = resultSet.getString(4);
-                    boolean defaultMatches = expectedDefault == null
-                            ? defaultKind == null || defaultKind.isEmpty()
-                            : "DEFAULT".equalsIgnoreCase(defaultKind) && normalizeSql(expectedDefault).equals(normalizeSql(defaultExpression));
-                    if (!expectedColumn[0].equals(resultSet.getString(1))
-                            || !normalizeSql(columnType(definition)).equals(normalizeSql(resultSet.getString(2)))
-                            || !defaultMatches) {
-                        throw new SQLException("ClickHouse table has an incompatible column definition: " + table + "." + expectedColumn[0]);
-                    }
-                }
-                if (resultSet.next()) {
-                    throw new SQLException("ClickHouse table has unexpected columns: " + table);
-                }
+                validateColumns(resultSet, table, expectedColumns);
             }
+        }
+    }
+
+    static void validateColumns(ResultSet resultSet, String table, String[][] expectedColumns) throws SQLException {
+        Map<String, String[]> actualColumns = new HashMap<>();
+        while (resultSet.next()) {
+            String name = resultSet.getString(1);
+            String[] definition = { resultSet.getString(2), resultSet.getString(3), resultSet.getString(4) };
+            if (name == null || actualColumns.put(name, definition) != null) {
+                throw new SQLException("ClickHouse table has an incompatible column definition: " + table);
+            }
+        }
+
+        for (String[] expectedColumn : expectedColumns) {
+            String[] actualColumn = actualColumns.remove(expectedColumn[0]);
+            if (actualColumn == null) {
+                throw new SQLException("ClickHouse table has missing columns: " + table);
+            }
+            String definition = expectedColumn[1];
+            String expectedDefault = defaultExpression(definition);
+            String defaultKind = actualColumn[1];
+            String defaultExpression = actualColumn[2];
+            boolean defaultMatches = expectedDefault == null
+                    ? defaultKind == null || defaultKind.isEmpty()
+                    : "DEFAULT".equalsIgnoreCase(defaultKind) && normalizeSql(expectedDefault).equals(normalizeSql(defaultExpression));
+            if (!normalizeSql(columnType(definition)).equals(normalizeSql(actualColumn[0])) || !defaultMatches) {
+                throw new SQLException("ClickHouse table has an incompatible column definition: " + table + "." + expectedColumn[0]);
+            }
+        }
+        if (!actualColumns.isEmpty()) {
+            throw new SQLException("ClickHouse table has unexpected columns: " + table);
         }
     }
 
@@ -221,17 +245,17 @@ public final class ClickHouseSchema {
                 + " SETTINGS fsync_after_insert=1,fsync_part_directory=1";
     }
 
-    private static String createWriterRegistration(Names names) {
-        return table(names.writerRegistration, columnDefinitions(WRITER_REGISTRATION_COLUMN_DEFINITIONS))
+    private static String createIdentityReservation(Names names) {
+        return table(names.identityReservation, columnDefinitions(IDENTITY_RESERVATION_COLUMN_DEFINITIONS))
                 + " ENGINE = MergeTree"
-                + " ORDER BY (registration_order,writer_id)"
-                + " SETTINGS fsync_after_insert=1,fsync_part_directory=1";
+                + " ORDER BY (sequence,block_start,writer_id)"
+                + " SETTINGS fsync_after_insert=1,fsync_part_directory=1,enable_block_number_column=1";
     }
 
     private static String createRetentionHighWater(Names names) {
         return table(names.retentionHighWater, columnDefinitions(RETENTION_HIGH_WATER_COLUMN_DEFINITIONS))
                 + " ENGINE = MergeTree"
-                + " ORDER BY (dataset_id,family,producer_sequence,rowid)"
+                + " ORDER BY (batch_sequence,family,rowid)"
                 + " SETTINGS fsync_after_insert=1,fsync_part_directory=1,non_replicated_deduplication_window=1000";
     }
 
@@ -247,7 +271,7 @@ public final class ClickHouseSchema {
                 + " ENGINE = CoalescingMergeTree"
                 + " PARTITION BY " + EVENT_PARTITION_KEY
                 + " ORDER BY " + EVENT_SORTING_KEY
-                + " SETTINGS fsync_after_insert=1,fsync_part_directory=1,non_replicated_deduplication_window=1000";
+                + " SETTINGS fsync_after_insert=1,fsync_part_directory=1,non_replicated_deduplication_window=1000," + SPARSE_SERIALIZATION_SETTING;
     }
 
     private static void validateDataSkippingIndexes(Connection connection, String database, String table, String[][] expectedIndexes) throws SQLException {
@@ -273,38 +297,38 @@ public final class ClickHouseSchema {
     }
 
     private static void addCompatibilityViews(List<String> statements, Names names) {
-        statements.add(view(names, ClickHouseFamily.ART_MAP, "e.rowid AS rowid,e.id AS id,e.name AS art"));
-        statements.add(rollbackView(names, ClickHouseFamily.BLOCK, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.type AS type,e.data AS data," + binary("e.meta", "meta") + "," + binary("e.blockdata", "blockdata") + ",e.action AS action"));
-        statements.add(view(names, ClickHouseFamily.CHAT, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.message AS message"));
-        statements.add(view(names, ClickHouseFamily.COMMAND, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.message AS message"));
-        statements.add(rollbackView(names, ClickHouseFamily.CONTAINER, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.type AS type,e.data AS data,e.amount AS amount," + binary("e.metadata", "metadata") + ",e.action AS action"));
-        statements.add(rollbackView(names, ClickHouseFamily.ENTITY_CONTAINER, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.entity_spawn_rowid AS entity_spawn_rowid,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.type AS type,e.data AS data,e.amount AS amount," + binary("e.metadata", "metadata") + ",e.action AS action"));
-        statements.add(view(names, ClickHouseFamily.ENTITY_INTERACTION, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.entity_spawn_rowid AS entity_spawn_rowid,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.type AS type,e.action AS action," + binary("e.metadata", "metadata") + ",e.rolled_back AS rolled_back"));
-        statements.add(rollbackView(names, ClickHouseFamily.ITEM, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.type AS type," + binary("e.payload", "data") + ",e.amount AS amount,e.action AS action"));
+        statements.add(currentView(names, ClickHouseFamily.ART_MAP, "e.rowid AS rowid,e.id AS id,e.name AS art"));
+        statements.add(rollbackView(names, ClickHouseFamily.BLOCK, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.type AS type,e.data AS data," + binary("e.meta", "meta") + "," + binary("e.blockdata", "blockdata") + ",e.action AS action"));
+        statements.add(view(names, ClickHouseFamily.CHAT, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.message AS message"));
+        statements.add(view(names, ClickHouseFamily.COMMAND, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.message AS message"));
+        statements.add(rollbackView(names, ClickHouseFamily.CONTAINER, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.type AS type,e.data AS data,e.amount AS amount," + binary("e.metadata", "metadata") + ",e.action AS action"));
+        statements.add(rollbackView(names, ClickHouseFamily.ENTITY_CONTAINER, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.entity_spawn_rowid AS entity_spawn_rowid," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.type AS type,e.data AS data,e.amount AS amount," + binary("e.metadata", "metadata") + ",e.action AS action"));
+        statements.add(view(names, ClickHouseFamily.ENTITY_INTERACTION, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.entity_spawn_rowid AS entity_spawn_rowid," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.type AS type,e.action AS action," + binary("e.metadata", "metadata") + ",e.rolled_back AS rolled_back"));
+        statements.add(rollbackView(names, ClickHouseFamily.ITEM, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.type AS type," + binary("e.payload", "data") + ",e.amount AS amount,e.action AS action"));
         statements.add(currentView(names, ClickHouseFamily.DATABASE_LOCK, "e.rowid AS rowid,e.status AS status,e.database_lock_time AS time"));
         statements.add(view(names, ClickHouseFamily.ENTITY, "e.rowid AS rowid,e.time AS time," + binary("e.payload", "data")));
         statements.add(entitySpawnView(names));
-        statements.add(view(names, ClickHouseFamily.ENTITY_MAP, "e.rowid AS rowid,e.id AS id,e.name AS entity"));
-        statements.add(view(names, ClickHouseFamily.MATERIAL_MAP, "e.rowid AS rowid,e.id AS id,e.name AS material"));
-        statements.add(view(names, ClickHouseFamily.BLOCKDATA_MAP, "e.rowid AS rowid,e.id AS id,e.text AS data"));
-        statements.add(view(names, ClickHouseFamily.SESSION, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.action AS action"));
-        statements.add(view(names, ClickHouseFamily.SIGN, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`,e.wid AS wid,e.x AS x,e.y AS y,e.z AS z,e.action AS action,e.color AS color,e.color_secondary AS color_secondary,e.sign_data AS data,e.waxed AS waxed,e.face AS face,e.line_1 AS line_1,e.line_2 AS line_2,e.line_3 AS line_3,e.line_4 AS line_4,e.line_5 AS line_5,e.line_6 AS line_6,e.line_7 AS line_7,e.line_8 AS line_8"));
+        statements.add(currentView(names, ClickHouseFamily.ENTITY_MAP, "e.rowid AS rowid,e.id AS id,e.name AS entity"));
+        statements.add(currentView(names, ClickHouseFamily.MATERIAL_MAP, "e.rowid AS rowid,e.id AS id,e.name AS material"));
+        statements.add(currentView(names, ClickHouseFamily.BLOCKDATA_MAP, "e.rowid AS rowid,e.id AS id,e.text AS data"));
+        statements.add(view(names, ClickHouseFamily.SESSION, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.action AS action"));
+        statements.add(view(names, ClickHouseFamily.SIGN, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.action AS action,e.color AS color,e.color_secondary AS color_secondary,e.sign_data AS data,e.waxed AS waxed,e.face AS face,e.line_1 AS line_1,e.line_2 AS line_2,e.line_3 AS line_3,e.line_4 AS line_4,e.line_5 AS line_5,e.line_6 AS line_6,e.line_7 AS line_7,e.line_8 AS line_8"));
         statements.add(view(names, ClickHouseFamily.SKULL, "e.rowid AS rowid,e.time AS time,e.name AS owner,e.text AS skin"));
-        statements.add(currentView(names, ClickHouseFamily.USER, "e.rowid AS rowid,e.time AS time,e.user_name AS `user`,e.uuid AS uuid"));
+        statements.add(currentView(names, ClickHouseFamily.USER, "e.rowid AS rowid,toUInt32(ifNull(e.data,toInt64(e.time))) AS time,e.user_name AS `user`,ifNull(e.uuid,'') AS uuid"));
         statements.add(view(names, ClickHouseFamily.USERNAME_LOG, "e.rowid AS rowid,e.time AS time,e.uuid AS uuid,e.user_name AS `user`"));
         statements.add(currentView(names, ClickHouseFamily.VERSION, "e.rowid AS rowid,e.time AS time,e.version AS version"));
-        statements.add(view(names, ClickHouseFamily.WORLD, "e.rowid AS rowid,e.id AS id,e.name AS world"));
+        statements.add(currentView(names, ClickHouseFamily.WORLD, "e.rowid AS rowid,e.id AS id,e.name AS world"));
     }
 
     private static String view(Names names, ClickHouseFamily family, String projection) {
         return "CREATE OR REPLACE VIEW " + names.table(family.getTableName())
-                + " AS SELECT " + projection
+                + " AS SELECT " + projection + locationKeys(family)
                 + " FROM " + events(names, family) + " AS e";
     }
 
     private static String currentView(Names names, ClickHouseFamily family, String projection) {
         return "CREATE OR REPLACE VIEW " + names.table(family.getTableName())
-                + " AS SELECT " + projection
+                + " AS SELECT " + projection + locationKeys(family)
                 + " FROM " + currentEvents(names, family) + " AS e";
     }
 
@@ -317,7 +341,7 @@ public final class ClickHouseSchema {
                 + " AS SELECT e.rowid AS rowid,e.time AS time"
                 + ",if(e.block_rowid_present=1,e.block_rowid,NULL) AS block_rowid"
                 + ",if(e.kill_rowid_present=1,e.kill_rowid,NULL) AS kill_rowid"
-                + ",e.uuid AS uuid,e.wid AS wid,e.current_wid AS current_wid"
+                + ",e.uuid AS uuid," + location("wid") + ",e.current_wid AS current_wid"
                 + ",e.origin_x AS origin_x,e.origin_y AS origin_y,e.origin_z AS origin_z"
                 + ",e.current_x AS x,e.current_y AS y,e.current_z AS z"
                 + ",e.yaw AS yaw,e.pitch AS pitch," + binary("if(e.entity_data_present=1,e.entity_data,NULL)", "data") + ",e.removed AS removed"
@@ -325,9 +349,15 @@ public final class ClickHouseSchema {
     }
 
     static String binary(String value, String alias) {
-        String presentValue = "ifNull(" + value + ",'')";
-        String bytes = "arrayMap(i -> reinterpretAsInt8(substring(" + presentValue + ",i,1)),range(1,length(" + presentValue + ")+1))";
-        return "if(isNull(" + value + "),CAST([], 'Array(Int8)'),arrayConcat([toInt8(0)]," + bytes + ")) AS " + alias;
+        return value + " AS " + alias;
+    }
+
+    private static String location(String column) {
+        return "if(e." + column + "_present=1,e." + column + ",NULL) AS " + column;
+    }
+
+    private static String locationKeys(ClickHouseFamily family) {
+        return family.isWorldScoped() ? ",e.wid AS _key_wid,e.x AS _key_x,e.z AS _key_z" : "";
     }
 
     private static String events(Names names, ClickHouseFamily family) {
@@ -464,7 +494,7 @@ public final class ClickHouseSchema {
         private final String eventData;
         private final String retentionHighWater;
         private final String storageMetadata;
-        private final String writerRegistration;
+        private final String identityReservation;
 
         private Names(String database, String prefix) {
             this.database = ClickHouseIdentifiers.quote(database, "ClickHouse database");
@@ -472,7 +502,7 @@ public final class ClickHouseSchema {
             eventData = table("event_data");
             retentionHighWater = table("retention_high_water");
             storageMetadata = table("storage_metadata");
-            writerRegistration = table("writer_registration");
+            identityReservation = table("identity_reservation");
         }
 
         private String table(String suffix) {

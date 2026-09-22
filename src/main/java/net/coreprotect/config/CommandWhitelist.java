@@ -29,7 +29,10 @@ public final class CommandWhitelist {
     }
 
     public static boolean isWhitelisted(CommandSender sender) {
-        return sender instanceof Player && whitelistedUuids.contains(((Player) sender).getUniqueId());
+        if (!(sender instanceof Player)) {
+            return true;
+        }
+        return whitelistedUuids.contains(((Player) sender).getUniqueId());
     }
 
     public static synchronized void reload() {

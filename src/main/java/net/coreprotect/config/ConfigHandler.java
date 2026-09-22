@@ -530,14 +530,14 @@ public class ConfigHandler extends Queue {
         } else {
             HikariConfig config = new HikariConfig();
             try {
-                Class.forName("com.mysql.cj.jdbc.Driver");
-                config.setDriverClassName("com.mysql.cj.jdbc.Driver");
+                Class.forName("org.mariadb.jdbc.Driver");
+                config.setDriverClassName("org.mariadb.jdbc.Driver");
             } catch (Exception e) {
-                config.setDriverClassName("com.mysql.jdbc.Driver");
+                config.setDriverClassName("org.mariadb.jdbc.Driver");
             }
 
             config.setJdbcUrl(
-                    "jdbc:mysql://" + ConfigHandler.host + ":" + ConfigHandler.port + "/" + ConfigHandler.database);
+                    "jdbc:mariadb://" + ConfigHandler.host + ":" + ConfigHandler.port + "/" + ConfigHandler.database);
             config.setUsername(ConfigHandler.username);
             config.setPassword(ConfigHandler.password);
             config.setMaximumPoolSize(ConfigHandler.maximumPoolSize);
